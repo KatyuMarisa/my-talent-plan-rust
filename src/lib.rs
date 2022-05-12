@@ -8,5 +8,7 @@ mod engines;
 mod server;
 mod common;
 
-pub use engines::{KvsEngine, KvStore};
+pub use engines::{KvsEngine, KvStore, SledKvsEngine};
 pub use errors::{Result, KvError};
+pub use common::{Request, Reply};
+pub use server::KvServer;

@@ -15,7 +15,7 @@ use crate::errors::KvError;
 /// The `writer` and `reader` use different user space buffer, which causes newly writen data may not visiable by reader, so a 
 /// `flush` after each write is essential.
 /// Besides, such implemention is not suitable for multi-thread condition. 
-///
+/// 
 /// TODO: implement DBFile with mmap, or other better solutions.
 ///
 /// Assumed that all files used by database has the unique format:

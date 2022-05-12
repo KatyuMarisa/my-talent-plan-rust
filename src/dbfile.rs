@@ -95,7 +95,7 @@ where
 {
     file: Box<dyn Storage>,
     header: Header,
-    phantom: (PhantomData<Header>, PhantomData<Record>),
+    _phantom: (PhantomData<Header>, PhantomData<Record>),
 }
 
 impl<Header, Record> DataBaseFile<Header, Record>
@@ -117,7 +117,7 @@ where
         let mut result = Self{
             file,
             header,
-            phantom: (PhantomData, PhantomData),
+            _phantom: (PhantomData, PhantomData),
         };
 
         if init {

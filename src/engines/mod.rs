@@ -26,7 +26,5 @@ pub trait KvsEngine {
 mod sled;
 mod kv;
 
-pub use kv::KvStore;
-
-// pub use self::kvs::KvStore;
-// pub use self::sled::SledKvsEngine;
+pub use self::kv::KvStore;
+pub use self::sled::SledKvsEngine;

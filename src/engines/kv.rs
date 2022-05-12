@@ -36,18 +36,26 @@ impl KvStore {
     }
 
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self> {
-        let (manifest, files) = Manifest::new(root_dir)?;
-        let mut store = Self {
-            manifest,
-            kv: HashMap::new(),
-            handles: HashMap::new(),
-            writer_handle: INVALID_FILE_ID,
-            compact_limit: 3 * FILE_SIZE_LIMIT as u64,
-            tot_size: 0
-        };
+        let mut root_dir: PathBuf = root_dir.into();
+        root_dir.push("MANIFEST");
+        if std::path::Path::new(&root_dir).exists() {
+            root_dir.pop();
+            KvStore::open(root_dir)
+        } else {
+            root_dir.pop();
+            let (manifest, files) = Manifest::new(root_dir)?;
+            let mut store = Self {
+                manifest,
+                kv: HashMap::new(),
+                handles: HashMap::new(),
+                writer_handle: INVALID_FILE_ID,
+                compact_limit: 3 * FILE_SIZE_LIMIT as u64,
+                tot_size: 0
+            };
+            store.init(files)?;
+            Ok(store)
+        }
 
-        store.init(files)?;
-        Ok(store)
     }
 
     fn init(&mut self, mut files: Vec<(file_id, Box<dyn Storage>)>) -> Result<()> {

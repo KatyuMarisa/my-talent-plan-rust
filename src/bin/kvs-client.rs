@@ -1,13 +1,15 @@
 use std::net::TcpStream;
+use std::process::exit;
 
-use clap::{crate_name, crate_version, crate_authors, command, Command, Arg};
+use clap::{crate_version, crate_authors, command, Command, Arg};
 use kvs::{Result};
+use kvs::{Reply, Request};
 
 fn main() -> Result<()> {
     let matches = command!()
         .author(crate_authors!())
         .version(crate_version!())
-        .name(crate_name!())
+        .name("kvs-client")
         .subcommand(
             Command::new("set")
             .about("set a key-value mapping")
@@ -67,50 +69,54 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let key: &str;
-    let value: &str;
+
+    let req: Request;
     let addr: &str;
-    let action: u8;
-    
+
     match matches.subcommand() {
         Some(("set", sub_matches)) => {
-            key = sub_matches.value_of("key").unwrap();
-            value = sub_matches.value_of("value").unwrap();
+            req = Request::SET {
+                key: sub_matches.value_of("key").unwrap().to_owned(),
+                value: sub_matches.value_of("value").unwrap().to_owned()
+            };
             addr = sub_matches.value_of("dst").unwrap();
-            action = 0;
         }
 
         Some(("get", sub_matches)) => {
-            key = sub_matches.value_of("key").unwrap();
-            value = sub_matches.value_of("value").unwrap();
+            req = Request::GET {
+                key: sub_matches.value_of("key").unwrap().to_owned(),
+            };
             addr = sub_matches.value_of("dst").unwrap();
-            action = 1;
         }
 
         Some(("rm", sub_matches)) => {
-            key = sub_matches.value_of("key").unwrap();
-            value = sub_matches.value_of("value").unwrap();
+            req = Request::REMOVE {
+                key: sub_matches.value_of("key").unwrap().to_owned(),
+            };
             addr = sub_matches.value_of("dst").unwrap();
-            action = 2;
         }
 
         _ => { unreachable!() }
     }
 
-    let mut conn = TcpStream::connect(addr)?;
-    // match action {
-    //     0 => {
+    let conn = TcpStream::connect(addr)?;
+    bincode::serialize_into(&conn, &req)?;
+    let reply: Reply = bincode::deserialize_from(&conn)?;
 
-    //     }
-
-    //     1 => {
-
-    //     }
-
-    //     2 => {
-
-    //     }
-    // }
+    match reply {
+        Ok(opt) => {
+            if let Request::GET{key: _} = req {
+                match opt {
+                    Some(value) => { println!("{}", value); }
+                    None => { println!("Key not found") }
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("{}", err);
+            exit(1);
+        }
+    }
 
     Ok(())
 }
