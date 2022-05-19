@@ -2,6 +2,7 @@
 mod mmap_learn_tests {
     use std::{io::{Read, Write}, fs::{OpenOptions, remove_file}, path::PathBuf};
     use memmap::MmapMut;
+    use lockfree;
 
     #[test]
     fn simple_mmap_test() -> std::io::Result<()> {
@@ -40,13 +41,9 @@ mod mmap_learn_tests {
         Ok(())
     }
 
-    // #[test]
-    // fn test_unknown() -> std::io::Result<()> {
-    //     let mut kv: HashMap<i32, i32> = vec![(1,1), (2,2), (3,3)].into_iter().collect();
-    //     let v: Vec<&i32> = kv.keys().into_iter().collect();
-    //     println!("{}", kv.len());
-    //     drop(kv);
-    //     println!("{}", v.len());
-    //     Ok(())
-    // }
+
+    fn lockfree_hashmap_test() {
+        let mp = lockfree::map::Map::<String, String>::new();
+        mp.insert("key1".to_owned(), "value1".to_owned());
+    }
 }

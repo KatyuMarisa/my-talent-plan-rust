@@ -14,6 +14,8 @@ pub enum KvError {
     FileSizeExceed,
     #[fail(display = "DataBase corrpution")]
     MaybeCorrput,
+    #[fail(display = "Race")]
+    DataRace,
 }
 
 impl From<io::Error> for KvError {

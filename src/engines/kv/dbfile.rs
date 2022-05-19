@@ -1,6 +1,7 @@
 use std::fs::{create_dir_all, OpenOptions, remove_file};
-use std::{fmt::Debug, path::PathBuf};
+use std::{path::PathBuf};
 use std::marker::PhantomData;
+use std::fmt::Debug;
 
 use memmap::{MmapMut};
 use serde::Deserialize;
@@ -9,20 +10,18 @@ use bincode::{serialize, deserialize, deserialize_from as deserialize_stream};
 
 use crate::errors::{Result, KvError};
 
-pub trait Storage {
+pub trait Storage: Sync {
     fn new(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
     fn open(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
-    fn read(&self, offset: usize, length: usize) -> Result<&[u8]>;  // TODO: Shallow Copy
-    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()>; 
+    fn read(&self, offset: usize, length: usize) -> Result<&[u8]>;
+    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()>;
     fn sync(&mut self) -> Result<()>;
     fn close(self) -> Result<()>;
-    fn remove(self) -> Result<()>;  // TODO: is move better than borrow?
+    fn remove(self) -> Result<()>;
 }
 
-pub type Pos = (usize, usize);
-
 pub struct MmapFile {
-    mmap: MmapMut,
+    mmap: memmap::MmapMut,
     path: PathBuf,
 }
 
@@ -88,6 +87,36 @@ impl Storage for MmapFile {
     }
 }
 
+pub trait Readable<Header, Record>: Sync
+where
+    Header: OrdinaryHeader,
+    Record: OrdinaryRecord
+{
+    fn open(file: Box<dyn Storage>) -> Result<Self> where Self: Sized;
+    fn read_record_at(&self, offset: usize, length: usize) -> Result<Record>;
+    fn all_records(&self) -> Result<Vec<(Pos, Record)>>;
+    fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]>;
+}
+
+pub trait Appendable<Header, Record>
+where
+    Header: OrdinaryHeader,
+    Record: OrdinaryRecord
+{
+    fn init(file: Box<dyn Storage>) -> Result<Self> where Self: Sized;
+    fn append_record(&mut self, r: &Record) -> Result<Pos>;
+    fn raw_append(&mut self, data: &[u8]) -> Result<Pos>;
+    fn sync(&mut self) -> Result<()>;
+}
+
+pub trait ReadableAppendable<H, R>: Readable<H, R> + Appendable<H, R>
+where
+    H: OrdinaryHeader,
+    R: OrdinaryRecord
+{ }
+
+pub type Pos = (usize, usize);
+
 pub struct DataBaseFile<Header, Record>
 where
     Header: OrdinaryHeader,
@@ -95,72 +124,37 @@ where
 {
     file: Box<dyn Storage>,
     header: Header,
-    _phantom: (PhantomData<Header>, PhantomData<Record>),
+    _phantom: PhantomData<Record>
 }
 
-impl<Header, Record> DataBaseFile<Header, Record>
+impl<Header, Record> Readable<Header, Record> for DataBaseFile<Header, Record>
 where
     Header: OrdinaryHeader,
-    Record: OrdinaryRecord,
+    Record: OrdinaryRecord
 {
-    pub fn open(file: Box<dyn Storage>, init: bool) -> Result<Self> {
-        let header = {
-            if init {
-                Header::default()
-            } else {
-                deserialize(
-                    file.read(0, Header::header_length())?
-                )?
-            }
-        };
-
-        let mut result = Self{
+    fn open(file: Box<dyn Storage>) -> Result<Self> where Self: Sized {
+        let header = deserialize(file.read(0, Header::header_length())?)?;
+        let result = Self{
             file,
             header,
-            _phantom: (PhantomData, PhantomData),
+            _phantom: PhantomData
         };
-
-        if init {
-            result.reset_file_length(Header::header_length())?;
-            result.sync()?;
-        }
-
         Ok(result)
     }
 
-    pub fn read_record_at(&self, offset: usize, length: usize) -> Result<Record> {
-        Ok (deserialize(self.file.read(offset, length)?)? )
+    fn read_record_at(&self, offset: usize, length: usize) -> Result<Record> {
+        Ok (
+            deserialize(self.file.read(offset, length)?)?
+        )
     }
 
-    pub fn append_record(&mut self, record: &Record) -> Result<Pos> {
-        let start = self.header.get_file_length();
-        let data = serialize(&record)?;
-        if start + data.len() > FILE_SIZE_LIMIT {
-            return Err(KvError::FileSizeExceed.into())
-        } else {
-            self.file.write(start, &data)?;
-            self.reset_file_length(start + data.len())?;
-            Ok((start, data.len()))
-        }
-    }
-
-    pub fn reset_file_length(&mut self, length: usize) -> Result<()> {
-        self.header.set_file_length(length);
-        let mut data = serialize(&self.header)?;
-        data.resize(Header::header_length(), 0);
-        self.file.write(0, &data)
-    }
-
-    // TODO: split block into meta_block and data_block for quick recover
-    pub fn all_records(&self) -> Result<Vec<(Pos, Record)>> {
+    fn all_records(&self) -> Result<Vec<(Pos, Record)>> {
         let mut records = Vec::<(Pos, Record)>::new();
         let mut cursor = std::io::Cursor::new(
             self.file.read(Header::header_length(),
                 self.header.get_file_length() - Header::header_length())?
         );
-
         let mut offset = 0;
-
         loop {
             match deserialize_stream(&mut cursor) {
                 Ok(record) => {
@@ -171,16 +165,13 @@ where
                         record
                     ));
                 }
-
                 Err(err) => {
                     let mut is_error = true;
-
                     if let bincode::ErrorKind::Io(io_err) = err.as_ref() {
                         if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
                             is_error = false;
                         }
                     }
-
                     if is_error {
                         return Err(KvError::from(err).into())
                     } else {
@@ -192,21 +183,93 @@ where
         return Ok(records)
     }
 
-    pub fn sync(&mut self) -> Result<()> {
-        self.file.sync()
+    fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]> {
+        self.file.read(offset, length)
+    }
+}
+
+
+impl<Header, Record> Appendable<Header, Record> for DataBaseFile<Header, Record>
+where
+    Header: OrdinaryHeader,
+    Record: OrdinaryRecord
+{
+    fn init(file: Box<dyn Storage>) -> Result<Self> where Self: Sized {
+        let header = Header::default();
+        let mut res = Self {
+            file,
+            header,
+            _phantom: PhantomData
+        };
+
+        res.reset_file_length(Header::header_length())?;
+        res.sync()?;
+        Ok(res)
     }
 
-    pub fn close(&mut self) -> Result<()> {
-        self.file.sync()?;
+    fn append_record(&mut self, r: &Record) -> Result<Pos> {
+        let start = self.header.get_file_length();
+        let data = bincode::serialize(r)?;
+        if start + data.len() > FILE_SIZE_LIMIT {
+            return Err(KvError::FileSizeExceed.into())
+        } else {
+            self.file.write(start, &data)?;
+            self.reset_file_length(start + data.len())?;
+            Ok((start, data.len()))
+        }
+    }
+
+    fn raw_append(&mut self, data: &[u8]) -> Result<Pos> {
+        let start = self.header.get_file_length();
+        if start + data.len() > FILE_SIZE_LIMIT {
+            return Err(KvError::FileSizeExceed.into());
+        } else {
+            self.file.write(start, data)?;
+            self.reset_file_length(start + data.len())?;
+            Ok((start, data.len()))
+        }
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.file.sync()
+    }
+}
+
+impl<Header, Record> DataBaseFile<Header, Record>
+where
+    Header: OrdinaryHeader,
+    Record: OrdinaryRecord
+{
+    fn reset_file_length(&mut self, length: usize) -> Result<()> {
+        self.header.set_file_length(length);
+        let mut data = bincode::serialize(&self.header)?;
+        data.resize(Header::header_length(), 0);
+        self.file.write(0, &data)
+    }
+
+    fn close(self) -> Result<()> {
+        drop(self.file);
         Ok(())
     }
 }
+
+
+// impl<Header, Record> DataBaseFile<Header, Record>
+// where
+//     Header: OrdinaryHeader,
+//     Record: OrdinaryRecord
+// {
+//     /// for quick compaction
+//     pub fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]> {
+//         self.file.read(offset, length)
+//     }
+
+// }
 
 pub trait FixSizedHeader {
     fn header_length() -> usize;
     fn default_serialize() -> Result<Vec<u8>>;
     fn magic(&self) -> u8;
-
     fn get_file_length(&self) -> usize;
     fn set_file_length(&mut self, len: usize);
 }
@@ -222,22 +285,18 @@ impl<const MAGIC: u8> FixSizedHeader for DefaultHeader<MAGIC> {
     fn magic(&self) -> u8 {
         self.magic
     }
-
     fn header_length() -> usize {
-        HEADER_LENGTH
+        HEADER_LENGTH as usize
     }
-
     fn default_serialize() -> Result<Vec<u8>> {
         let mut data = serialize(&Self::default())?;
         assert!(data.len() <= Self::header_length());
         data.resize(Self::header_length(), 0);
         Ok(data)
     }
-
     fn get_file_length(&self) -> usize {
         return self.file_length
     }
-
     fn set_file_length(&mut self, len: usize) {
         self.file_length = len;
     }
@@ -253,13 +312,13 @@ impl<const MAGIC: u8> Default for DefaultHeader<MAGIC> {
 }
 
 impl<const MAGIC: u8> OrdinaryHeader for DefaultHeader<MAGIC> { }
+pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader + Default + Sync { }
+pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Sync { }
 
-pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader + Default { }
-pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug { }
+pub const HEADER_LENGTH: u8 = 24;
+const PAGES_PER_FILE: usize = 5;
+pub const FILE_SIZE_LIMIT: usize = PAGES_PER_FILE * (1 << 12); 
 
-const HEADER_LENGTH: usize = 24;
-const PAGES_PER_FILE: usize = 3;
-pub const FILE_SIZE_LIMIT: usize = 4096 * PAGES_PER_FILE;
 
 #[cfg(test)]
 mod dbfile_unit_tests {
@@ -271,7 +330,7 @@ mod dbfile_unit_tests {
 
         let mut dbf = TestFile::open(Box::new(
             MmapFile::new(file_path)?
-        ), true)?;
+        ))?;
 
         let (off, len) = dbf.append_record( &TestRecord {
             x: 1,
@@ -292,7 +351,7 @@ mod dbfile_unit_tests {
 
         let mut dbf = TestFile::open(Box::new(
             MmapFile::new(&file_path)?
-        ), true)?;
+        ))?;
 
         let records = dbf.all_records()?;
         assert_eq!(records.len(), 0);
@@ -324,7 +383,7 @@ mod dbfile_unit_tests {
 
         dbf = TestFile::open(Box::new(
             MmapFile::open(&file_path)?
-        ), false)?;
+        ))?;
 
         for (i, (offset, len)) in rids.iter().enumerate() {
             let record = dbf.read_record_at(*offset, *len)?;
@@ -346,7 +405,7 @@ mod dbfile_unit_tests {
         s: String,
     }
 
-    impl crate::dbfile::OrdinaryRecord for TestRecord { }
+    impl OrdinaryRecord for TestRecord { }
 
     const TEST_HEADER_MAGIC: u8 = 254;
     type TestFile = DataBaseFile<DefaultHeader<TEST_HEADER_MAGIC>, TestRecord>;
@@ -354,7 +413,7 @@ mod dbfile_unit_tests {
     use serde::{Serialize, Deserialize};
     use tempfile::tempdir;
 
-    use crate::{Result, dbfile::{Storage, MmapFile}};
-    use std::{path::PathBuf};
-    use super::{DataBaseFile, DefaultHeader};
+    use crate::{Result, engines::kv::dbfile::{MmapFile, Storage}};
+    use std::path::PathBuf;
+    use super::{DataBaseFile, DefaultHeader, OrdinaryRecord, Readable, Appendable};
 }
