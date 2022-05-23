@@ -42,8 +42,12 @@ mod mmap_learn_tests {
     }
 
 
+    #[test]
     fn lockfree_hashmap_test() {
-        let mp = lockfree::map::Map::<String, String>::new();
-        mp.insert("key1".to_owned(), "value1".to_owned());
+        let a50 = std::sync::atomic::AtomicUsize::new(50);
+        a50.fetch_sub(10, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a50.load(std::sync::atomic::Ordering::Acquire), 40);
+        a50.fetch_sub(10, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(a50.fetch_sub(10, std::sync::atomic::Ordering::Acquire), 30);
     }
 }

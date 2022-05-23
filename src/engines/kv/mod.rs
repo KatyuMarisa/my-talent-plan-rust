@@ -1,7 +1,6 @@
-mod kvstore;
 mod dbfile;
 mod manifest;
 mod memtable;
-mod store;
+mod kvstore;
 mod kvfile;
 mod writebatch;

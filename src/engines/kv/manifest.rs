@@ -107,6 +107,10 @@ impl Manifest {
         Ok(())
     }
 
+    pub fn all_fids(&self) -> Vec<FileId> {
+        return self.files.iter().map(|it| {*it}).collect();
+    }
+
     pub fn disk_usage(&self) -> usize {
         return self.files.len() * FILE_SIZE_LIMIT;
     }

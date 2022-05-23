@@ -10,7 +10,7 @@ use bincode::{serialize, deserialize, deserialize_from as deserialize_stream};
 
 use crate::errors::{Result, KvError};
 
-pub trait Storage: Sync {
+pub trait Storage: Sync + Send {
     fn new(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
     fn open(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
     fn read(&self, offset: usize, length: usize) -> Result<&[u8]>;
@@ -87,7 +87,7 @@ impl Storage for MmapFile {
     }
 }
 
-pub trait Readable<Header, Record>: Sync
+pub trait Readable<Header, Record>: Sync + Send
 where
     Header: OrdinaryHeader,
     Record: OrdinaryRecord
@@ -231,6 +231,9 @@ where
     }
 
     fn sync(&mut self) -> Result<()> {
+        let mut data = bincode::serialize(&self.header)?;
+        data.resize(Header::header_length(), 0);
+        self.file.write(0, &data)?;
         self.file.sync()
     }
 }
@@ -242,9 +245,7 @@ where
 {
     fn reset_file_length(&mut self, length: usize) -> Result<()> {
         self.header.set_file_length(length);
-        let mut data = bincode::serialize(&self.header)?;
-        data.resize(Header::header_length(), 0);
-        self.file.write(0, &data)
+        Ok(())
     }
 
     fn close(self) -> Result<()> {
@@ -312,13 +313,13 @@ impl<const MAGIC: u8> Default for DefaultHeader<MAGIC> {
 }
 
 impl<const MAGIC: u8> OrdinaryHeader for DefaultHeader<MAGIC> { }
-pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader + Default + Sync { }
-pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Sync { }
+pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader + Default + Send + Sync{ }
+pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Send + Sync { }
 
 pub const HEADER_LENGTH: u8 = 24;
-const PAGES_PER_FILE: usize = 5;
-pub const FILE_SIZE_LIMIT: usize = PAGES_PER_FILE * (1 << 12); 
-
+pub const FILE_SIZE_LIMIT: usize = 1 << 20; 
+const PAGE_SIZE: usize = 1 << 12;
+const PAGES_PER_FILE: usize = FILE_SIZE_LIMIT / PAGE_SIZE;
 
 #[cfg(test)]
 mod dbfile_unit_tests {
