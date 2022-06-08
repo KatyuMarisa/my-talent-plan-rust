@@ -19,8 +19,8 @@ struct KvStoreInner {
     memtable: Arc<Memtable>,
     sstables: Arc<ThreadSafeMap<FileId, Box<KVSSTable>>>,
     init_compaction_limit: usize,
-    bg_flush_cond: Arc<Condvar>,
-    bg_pending_cond: Arc<Condvar>,
+    bg_flush_cond: Arc<Condvar>,        // condvar for memtable to wakeup flush thread.
+    bg_pending_cond: Arc<Condvar>,      // condvar for wakeup pending requests. 
     bg_pending_mutex: Arc<Mutex<u8>>,
     running: Arc<Mutex<bool>>,
 }
@@ -76,7 +76,6 @@ impl KvStore {
             bg_cond,
             running
         })
-
     }
 
     pub fn stop(self) {
@@ -172,10 +171,10 @@ impl KvStoreInner {
         }
     }
 
-    /// A complex method to avoid duplicate code. This function will retry
+    /// A complex method to avoid duplicate code.
     /// F: function which must return a MemtableState
     /// V: value that return from F
-    /// C: callback on Value return from F.
+    /// C: callback on Value which returned from func.
     /// R: return type for callback
     fn retry_loop<F, V, C, R>(&self, func: F, cb: C) -> Result<R>
     where
@@ -209,14 +208,14 @@ impl KvStoreInner {
                 }
 
                 (MemtableState::FlushRace, _) => {
-                    // std::thread::sleep(std::time::Duration::from_millis(100));
-                    _ = self.bg_pending_cond.wait(self.bg_pending_mutex.lock().unwrap());
+                    // wakeup may lost, so we set a timeout
+                    _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_secs(5));
                     flush_race_retry += 1;
                 }
 
                 (MemtableState::CompactionRace, _) => {
-                    // std::thread::sleep(std::time::Duration::from_millis(200));
-                    _ = self.bg_pending_cond.wait(self.bg_pending_mutex.lock().unwrap());
+                    // wakeup may lost, so we set a timeout
+                    _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_secs(5));
                     compaction_race_retry += 1;
                 }
 
@@ -267,7 +266,7 @@ impl KvStoreInner {
         // try to flush first...
         let mut batch = WriteBatch::new(self.manifest.clone()).expect("create WriteBatch error");
         let start_travel_records = std::time::Instant::now();
-        let records = self.memtable.remove_flushable();
+        let records = self.memtable.take_all_flushable();
         stat.timecost_get_values += start_travel_records.elapsed().as_millis();
         stat.bytes_size += batch.disk_usage();
         self.write_to_batch(&mut batch, records, &mut stat).expect("write to WriteBatch error");
@@ -286,7 +285,7 @@ impl KvStoreInner {
             let before_fids = self.manifest.lock().unwrap().all_fids();
             batch = WriteBatch::new(self.manifest.clone()).expect("create WriteBatch error");
             let start_travel_records = std::time::Instant::now();
-            let records = self.memtable.remove_all();
+            let records = self.memtable.take_all();
             stat.timecost_get_values += start_travel_records.elapsed().as_millis();
             self.write_to_batch(&mut batch, records, &mut stat).expect("write to WriteBatch error");
             batch.mark_fid_invalid(before_fids);
@@ -351,7 +350,7 @@ impl KvStoreInner {
                 }
             }
 
-            self.memtable.raw_set(guard.key(), MemtableValue::RID(rid));;
+            self.memtable.raw_set(guard.key(), MemtableValue::RID(rid));
         }
         stat.num_records += num_records;
         stat.timecost_prepare_and_reset += start.elapsed().as_millis();
@@ -511,25 +510,25 @@ mod kvstore_unit_test {
 
         // drop and then reopen
         kvs.stop();
-        // let kvs = KvStore::open(root_dir)?;
-        // // final concurrent get
-        // let mut get_threads = Vec::new();
-        // for i in 0..num_get_threads {
-        //     let kvs_handle = kvs.clone();
-        //     let thread_handle = std::thread::spawn(move || {
-        //         for j in 0..num_set_threads/num_get_threads {
-        //             for k in num_records_per_thread/2..num_records_per_thread {
-        //                 let key = format!("key-{}-{}", num_set_threads/num_get_threads*i + j, k);
-        //                 let value = format!("value-{}-{}", num_set_threads/num_get_threads*i + j, k);
-        //                 assert_eq!(value, kvs_handle.get(key).unwrap().unwrap())
-        //             }
-        //         }
-        //     });
-        //     get_threads.push(thread_handle);
-        // }
-        // for h in get_threads {
-        //     h.join().unwrap();
-        // }
+        let kvs = KvStore::open(root_dir)?;
+        // final concurrent get
+        let mut get_threads = Vec::new();
+        for i in 0..num_get_threads {
+            let kvs_handle = kvs.clone();
+            let thread_handle = std::thread::spawn(move || {
+                for j in 0..num_set_threads/num_get_threads {
+                    for k in num_records_per_thread/2..num_records_per_thread {
+                        let key = format!("key-{}-{}", num_set_threads/num_get_threads*i + j, k);
+                        let value = format!("value-{}-{}", num_set_threads/num_get_threads*i + j, k);
+                        assert_eq!(value, kvs_handle.get(key).unwrap().unwrap())
+                    }
+                }
+            });
+            get_threads.push(thread_handle);
+        }
+        for h in get_threads {
+            h.join().unwrap();
+        }
 
         // congratulations!
         Ok(())

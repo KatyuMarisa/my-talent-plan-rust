@@ -2,7 +2,7 @@ use std::sync::{Condvar, Arc};
 use std::{sync::atomic::AtomicUsize};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
 
-use lockfree::map::{Map as LockFreeMap, Iter, ReadGuard};
+use lockfree::map::{Map as LockFreeMap, ReadGuard};
 use lockfree::set::Set as LockFreeSet;
 
 use super::manifest::RID;
@@ -92,7 +92,8 @@ impl Memtable {
             return state
         }
         // We could *not* remove directly from self.map because such key may also exist in SSTable.
-        // A key is guarented to be removed if a TOMB record is flushed into SSTable. 
+        // 
+        // A key is guarented to be removed if a TOMB record is flushed into disk. 
         // 
         // Another choosable solution in pseudo code:
         // 
@@ -107,8 +108,8 @@ impl Memtable {
         //     return KeyNotExist
         // }
         // 
-        // Such solution will be more effective if most operation try to remove non-exist key, which is
-        // really rare. On the other hand, such operation will return an error, which is very heavy 
+        // Such solution will be more effective if most operation try to remove non-exist keys, which is
+        // really rare. On the other hand, such operation will result in error, which is very heavy 
         // (because of the resolve of symbol table and runtime support). So we don't choose the solution above.
         // 
         let len = key.len();
@@ -128,7 +129,7 @@ impl Memtable {
         }
     }
 
-    // This method can only be invoked when database is recovering or when database is doing flush/compaction.
+    // This method can only be called when database is recovering or when database is doing flush/compaction.
     // Because we have forbiden all read/write requests, so it's safe.
     pub fn raw_set(&self, key: &String, val: MemtableValue) {
         let pin = self.pin_count.load(Relaxed);
@@ -136,130 +137,50 @@ impl Memtable {
             pin == Self::PINCOUNT_FLUSH ||
             pin == (Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH));
 
-        self.map.insert(key.to_owned(), val.clone());        
-        match val {
-            MemtableValue::Value(None) => {
-                self.uncompacted.fetch_add(key.len(), Relaxed);
-            }
-
-            MemtableValue::RID(rid) => {
-                // nothing todo
-            }
-
-            _ => {
-                unreachable!();
-            }
+        if let MemtableValue::Value(Some(_)) = &val {
+            unreachable!();
         }
+
+        self.map.insert(key.to_owned(), val);
     }
 
-    // This metchod can only be invoked when database is recovering, which is safe.
+    // This metchod can only be called when database is recovering, which is safe.
     pub fn raw_remove(&self, key: &String) {
         assert!(self.pin_count.load(Relaxed) == 0);
         self.map.remove(key);
     }
 
-    pub fn remove_flushable(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
+    // Lazily remove all keys in self.uncompacted_keys and return an iterator of all flushable kv-pairs.
+    pub fn take_all_flushable(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
         assert!(self.pin_count.load(Relaxed) == Self::PINCOUNT_FLUSH);
-        // TODO: Learn more about move.
         self.uncompacted.store(0, SeqCst);
         self.uncompacted_keys.iter().map(move |guard| {
             self.uncompacted_keys.remove(guard.as_ref());
             self.map.get(guard.as_ref()).unwrap()
         })
-
-        // let mut should_flush = Vec::new();
-
-        // for key_guard in self.uncompacted_keys.iter() {
-        //     self.uncompacted_keys.remove(key_guard.as_ref()).unwrap();
-        //     should_flush.push(self.map.get(key_guard.as_ref()).unwrap());
-        // }
-
-        // return should_flush.into_iter();
-
-        // for guard in self.uncompacted_keys.iter() {
-        //     self.uncompacted_keys.remove(guard.as_ref());
-        //     should_flush.push(self.map.get(guard.as_ref()).unwrap());
-        // }
-
-
-        // return should_flush.into_iter()
-        // unimplemented!()
-
-        // self.uncompacted.store(0, SeqCst);
-        // return should_flush;
-
-        // let keys = self.uncompacted_keys.iter().collect::<Vec<_>>();
-        // let mut should_flush = Vec::new();
-
-        // for key in keys {
-        //     should_flush.push(self.map.get(key.as_ref()).unwrap());
-        //     self.uncompacted_keys.remove(key.as_ref());
-        // }
-        // self.uncompacted.store(0, SeqCst);
-        // return should_flush;
-        
-        // assert!(self.pin_count.load(Relaxed) == Self::PINCOUNT_FLUSH);
-        // let keys = self.map.iter()
-        //     .filter(|kv| {
-        //         if let MemtableValue::RID(_) = kv.val() {
-        //             return false;
-        //         }
-        //         return true;
-        //     });
- 
-        // // prepare a big buffer
-        // let mut should_flush = Vec::<(String, MemtableValue)>::with_capacity(10000);
-        // for kv in keys {
-        //     self.map.remove(kv.key()).unwrap();
-        //     should_flush.push(
-        //         // Removed::<String, MemtableValue>::try_into(rm).unwrap()
-        //         (kv.key().to_owned(), kv.val().to_owned())
-        //     );
-        // }
-        // // reset uncompacted bytes.
-        // self.uncompacted.store(0, SeqCst);
-        // return should_flush;
     }
 
-    pub fn remove_all(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
+    // Return an iterator across all values in Memtable.
+    pub fn take_all(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
         assert!(self.pin_count.load(Relaxed) == Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH);
         // assert!(self.uncompacted_keys.iter().count() == 0);  time consuming
         self.map.iter()
-
-        // let keys = self.map.iter();
-        // let mut all_values = Vec::with_capacity(10000);
-        // let mut removed_uncompacted_size: usize = 0;
-        
-        // for kv in keys {
-        //     self.map.remove(kv.key()).unwrap();
-        //     if let MemtableValue::Value(Some(valuestr)) = kv.val() {
-        //         removed_uncompacted_size += valuestr.len();
-        //     } else {
-        //         removed_uncompacted_size += kv.key().len();
-        //     }
-        
-        //     all_values.push(
-        //         // Removed::<String, MemtableValue>::try_into(rm).unwrap()
-        //         (kv.key().to_owned(), kv.val().to_owned())
-        //     );
-        // }
-        // return all_values;
     }
 
     pub fn should_flush(&self) -> bool {
         return self.uncompacted.load(Acquire) >= self.flush_limit;
     }
 
-    // TODO: maybe hungry.
     pub fn pin_flush(&self) -> bool {
         loop {
             let pin = self.pin_count.load(Acquire);
             if pin >= Self::PINCOUNT_FLUSH {
                 return false;
             }
-            
+ 
             if let Ok(_) = self.pin_count.compare_exchange(pin, pin + Self::PINCOUNT_FLUSH,
                 Acquire, Relaxed) {
+                // We have block all succeed read/write requests. Now we are waiting for remaining requests to finish.
                 loop {
                     assert!(self.pin_count.load(Relaxed) >= Self::PINCOUNT_FLUSH);
                     if Self::PINCOUNT_FLUSH == self.pin_count.load(Acquire) {
@@ -335,7 +256,6 @@ mod memtable_unit_test {
     use std::sync::Arc;
     use std::sync::Condvar;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
 
     use rand::random;
 

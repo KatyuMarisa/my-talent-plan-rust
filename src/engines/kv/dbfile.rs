@@ -1,9 +1,9 @@
 use std::fs::{create_dir_all, OpenOptions, remove_file};
-use std::{path::PathBuf};
+use std::path::PathBuf;
 use std::marker::PhantomData;
 use std::fmt::Debug;
 
-use memmap::{MmapMut};
+use memmap::MmapMut;
 use serde::Deserialize;
 use serde::{Serialize, de::DeserializeOwned};
 use bincode::{serialize, deserialize, deserialize_from as deserialize_stream};
@@ -255,18 +255,6 @@ where
 }
 
 
-// impl<Header, Record> DataBaseFile<Header, Record>
-// where
-//     Header: OrdinaryHeader,
-//     Record: OrdinaryRecord
-// {
-//     /// for quick compaction
-//     pub fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]> {
-//         self.file.read(offset, length)
-//     }
-
-// }
-
 pub trait FixSizedHeader {
     fn header_length() -> usize;
     fn default_serialize() -> Result<Vec<u8>>;
@@ -286,18 +274,22 @@ impl<const MAGIC: u8> FixSizedHeader for DefaultHeader<MAGIC> {
     fn magic(&self) -> u8 {
         self.magic
     }
+
     fn header_length() -> usize {
         HEADER_LENGTH as usize
     }
+
     fn default_serialize() -> Result<Vec<u8>> {
         let mut data = serialize(&Self::default())?;
         assert!(data.len() <= Self::header_length());
         data.resize(Self::header_length(), 0);
         Ok(data)
     }
+
     fn get_file_length(&self) -> usize {
         return self.file_length
     }
+
     fn set_file_length(&mut self, len: usize) {
         self.file_length = len;
     }
@@ -317,7 +309,8 @@ pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader 
 pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Send + Sync { }
 
 pub const HEADER_LENGTH: u8 = 24;
-pub const FILE_SIZE_LIMIT: usize = 1 << 20; 
+// pub const FILE_SIZE_LIMIT: usize = 1 << 20;
+pub const FILE_SIZE_LIMIT: usize = 1 << 10; // For Test Only
 const PAGE_SIZE: usize = 1 << 12;
 const PAGES_PER_FILE: usize = FILE_SIZE_LIMIT / PAGE_SIZE;
 

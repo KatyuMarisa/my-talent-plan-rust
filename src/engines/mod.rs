@@ -28,3 +28,4 @@ mod sled;
 mod kv;
 
 pub use self::sled::SledKvsEngine;
+pub use self::kv::KvStore;

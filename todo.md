@@ -261,8 +261,141 @@ project 的目的应该是指导实现安全的内部可变性
 因为这对compaction和flush都非常有用。bitcast的compaction不需要访问SSTable，因为内存中已经维护了所有的keys，因此可以直接通过一轮遍历map实现compaction
 
 
-if maybe reach compaction size {
-    
-} else {
-
+怎么处理loop retry的逻辑？
+fn retry_loop<F, H, C, R>(func: F) -> R
+where
+    F: Fn() -> H,
+    H: Result<(V, MemtableState)>,
+    C: Fn() -> R,
+{
+    unimplement!()
 }
+
+pub struct KvStore {
+    inner: Arc<KvStoreInner>,
+    handle: Arc<JoinHandle<()>>,
+}
+
+迭代器一般是懒加载的，所以创建迭代器后立刻求长度可能不太现实
+
+2022.5.23：
+迭代器的懒加载+浅拷贝非常好用，但也要注意一下其转换引入的开销
+类型推导居然也可以渗入到内嵌类型中，这是rust编译器本身强还是说是类型推导通用的？
+总算完成无锁内存读了...虽然估计bench的效果还不如有锁读
+
+
+task-threadpool：
+
+1）Send？pool应该不需要Send，没有在线程间交换任何东西
+2）grateful stop
+3）error handling
+
+
+八股文中的线程池：
+core-thread + wait-thread + 任务队列
+
+只做core-thread就行了，任务传Box包裹的闭包
+所有core-thread启动后挂机在task-channel上等任务，main-loop先把channel读端取出队列，丢任务，
+core-thread完成任务后把自己的channel丢回队列
+
+为什么会想到channel？因为传任务涉及到线程间的move，需要Send Trait，job需要被Box包裹住，core-thread要先wait，接到任务后被wakeup。用channel实现wait和接收任务，接口最为简洁清晰
+
+main-loop也需要等待外界送任务，用阻塞队列更合适
+
+SharedQueueThreadPool
+
+
+new(nthread) {
+    task_queue = BlockQueue::with_capacity(nthread);
+
+    for _ in 0..nthread {
+        sender, receiver = create_spsc_channel();
+
+        let handle = thread::spawn(move || {
+            let sender = sender.clone();
+            loop {
+                let job = receiver.listen();
+                job();
+                // notify garbage collect
+                senders.push(sender);
+            }
+        })
+
+        handles.push(handle);
+        senders(sender);
+    }
+}
+
+spawn(job) {
+    task_queue.push(job);
+}
+
+所有请求都pend在同一把mutex上可能不是个好主意，因为notify all后不但会引入非常大的竞态，而且还导致了一段不短的时间内请求必须串行执行，与lockfree的本意相违背。而且这段代码也存在唤醒丢失的隐患，被迫引入了timeout。
+
+如果引入一个flush标志位也并不好，因为flush标志位必定要被多线程读，不采用同步语义的话难以保证flush的可见性。
+
+不如让它们等待在不同的lock上 —— 不行：
+>Note that any attempt to use multiple mutexes on the same condition variable may result in a runtime panic.
+
+总的来说，一个condVar只能和一个mutex绑定，但如果把多个请求pend到同一个cond上的话，就要被迫接受唤醒后的强竞态
+
+可能无法避免唤醒丢失了，只能采用超时重试的方法；
+需要一种新的同步原语
+
+spmc channel? 恐怕很难用，难以确定consumer的个数，Send阻塞了的话就全炸了，而且挨个唤醒仍然是串行的..
+spsc？唤醒绝对不会丢失，但可能需要额外引入一个lockfree队列
+crossbeam.Parker?
+我有点担心它是自旋的，在flush和compaction下都应该睡眠才对；不过它的行为和spsc很像，应该可以用，不过得包装一下；
+
+struct Pending {
+    
+}
+
+
+impl ThreadPool for SharedQueueThreadPool {
+    fn new(nthread: u32) -> Result<Self>
+    where
+        Self: Sized {
+        let mut thread_handles = Vec::new();
+        let senders = LockFreeQueue::new(nthread as usize);
+
+        for _ in 0..nthread {
+            let (sender, receiver) = channel::<TaskType>();
+            let handle = std::thread::spawn(move || {
+                loop {
+                    match receiver.recv() {
+                        Ok(job_wrapper) => {
+                            job_wrapper();
+                        }
+
+                        Err(err) => {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            thread_handles.push(handle);
+            senders.push(sender).unwrap();
+        }
+
+        Ok(Self{
+            thread_handles,
+            task_senders: Arc::new(senders),
+            cond: Condvar::new(),
+            lock: Mutex::new(false),
+        })
+    }
+
+    fn spawn<F>(&self, job: F)
+    where
+        F: Send + 'static + FnOnce() {
+        let sender = self.task_senders.pop().unwrap();
+        let sender2 = sender.clone();
+
+
+catch_unwind可以用在job内部，这样线程不会因为panic而丢失
+
+
+
+### tokio异步编程

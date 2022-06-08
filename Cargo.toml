@@ -19,6 +19,10 @@ failure_derive = "0.1.8"
 tempfile = "3.0.7"
 sled = "0.34.6"
 lockfree = "0.5.1"
+rand = "0.8.5"
+rayon = "1.5.3"
+crossbeam = "0.8.1"
+tokio = "1.19.1"
 
 [dev-dependencies]
 assert_cmd = "0.11.0"
@@ -29,3 +33,4 @@ sled = "0.34.6"
 panic-control = "0.1.4"
 criterion = "0.2.11"
 crossbeam-utils = "0.6.5"
+tokio = {version = "1.19.1", features = ["full"]}
