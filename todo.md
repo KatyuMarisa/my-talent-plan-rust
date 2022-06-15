@@ -8,7 +8,6 @@ str在rust中到底是什么？
 ============================================
 
 
-
 S：
 ——————————————————————————————————————————————————————————————————
 impl KvStore {
@@ -48,7 +47,6 @@ borrow并不导致所有权转移，仅仅是借用，所以&mut self之间是�
 所有权系统貌似比我想象的还要复杂不少，所有权的检查同时发生在编译时和运行时
 
 
-
 Send Sync
 几个可以确定的东西：
 1）rust仅通过lifetime和ownership机制解决了data race，并没有解决concurrency problem。Send和Sync这两个marker也仅是用于解决data race问题的
@@ -82,7 +80,6 @@ Arc<Mutex<T>> ? 底层OS语义保证所有权移交不产生冲突，所有权�
 总体思路：
 Arc<T>实现了Send，则 & immut Arc<T>实现了Sync，使得我们不需要关心T内部对象是否需要Send/Sync。为T设计内部可变性的接口，使用原子操作/小粒度锁保证内部的约束一致性。
 不使用锁的话去维护多个变量间的约束一致性很困难，不如将状态转换为用单个变量的原子操作；
-
 
     struct Memtable {
         content: lockfree:HashMap<Key, Data>;
@@ -238,7 +235,6 @@ project 的目的应该是指导实现安全的内部可变性
         self.memtable.wunlock_phony();
     }
 
-
 上面的设计其实比较投机取巧，只不过是在一个lockfree数据结构上实现了一个简单的自旋锁而已。虽然project让实现一个lock-free reader，且read/write也真正做到了互不阻塞，但思路最终也还是回到了锁上。
 本质上讲，我们需要锁的核心原因仍然是要保证结构体成员间的invariants在并发环境下仍然能够维持，因此即使引入了lockfree map，仍然会因为要维持这个map与结构体内其他成员在并发环境下的invariants而回到锁的思路上。
 
@@ -282,7 +278,6 @@ pub struct KvStore {
 迭代器的懒加载+浅拷贝非常好用，但也要注意一下其转换引入的开销
 类型推导居然也可以渗入到内嵌类型中，这是rust编译器本身强还是说是类型推导通用的？
 总算完成无锁内存读了...虽然估计bench的效果还不如有锁读
-
 
 task-threadpool：
 
@@ -396,6 +391,241 @@ impl ThreadPool for SharedQueueThreadPool {
 
 catch_unwind可以用在job内部，这样线程不会因为panic而丢失
 
-
-
 ### tokio异步编程
+pin 是啥，看到好多次了，理解不能
+
+总算找到专业名词了，**惊群现象**
+
+### tokio同步原语
+Mutex、RWMutex，基于标准库，不推荐采用
+Channel，种类繁多，不用担心异步下的data race，推荐使用
+Barrier，屏障，感觉目前用途不大
+Semaphore，信号灯，设定最大异步并发数
+Notify，类似于Semaphore = 1的信号灯，我居然忘了有这个同步原语！所有线程必定是阻塞在同一个wait_queue上的！
+
+### tokio异步网络库
+有了await关键字后，感觉几乎和同步编程一样了
+
+### 如何实现异步？为什么要异步？哪些操作可以异步？
+结合下bule store？
+
+##### why futures? networking vs file/io, blocking vs non-blocking, sync vs async
+
+
+##### futures from a user persective (not a poll-centric implementation perspective)
+don't think too hard about executors and runtimes
+method chaining and how it transforms the future type
+debugging Rust types
+Result vs Future vs FutureResult
+error handling with futures
+concrete futures vs boxed futures vs anonymous futures
+note about futures 0.1 and futures 0.3 (we'll use futures 0.1)
+note about async / await
+
+### 项目设计
+
+##### KvStore要自带线程池
+wtf？不应该是KvServer自带线程池吗？
+
+    The key/value engine that reads and writes to files will remain 
+    synchronous, scheduling work on an underlying thread pool, 
+    while presenting an asynchronous interface. Along the way you will
+    experiment with multiple ways of defining and working with future types.
+
+    Your KvsServer will be based on the tokio runtime, which handles the
+    distribution of asynchronous work to multiple threads on its own 
+    (tokio itself contains a thread pool). This means that your architecture 
+    will actually have two layers of thread pools: the first handling with 
+    the networking, asynchronously, one thread per core; the second handling
+    the file I/O, synchronously, with enough threads to keep the networking
+    threads as busy as possible.
+
+
+KvStore的线程池负责读/写/压缩，以充分应用多线程优势，本身是同步过程但要提供异步接口？为什么要提供异步接口？还是因为这可能是一个长任务，需要await切换。虽然我的实现是基于mmap的，但由于mmap的
+懒加载机制，page fault和swap仍然可能陷入内核，不可忽视。mmap真的不如缓冲池，不能精准控制内存还是有点要命的。
+KvServer的线程池承接客户端请求，对于engine去spawn一个任务就行了。
+
+#### KvsClient使用异步IO，并变成一个future type（boxed future、explicit future、anonymous future）
+第一步不难，一个Cli就是一个单连接而已，把网络库换成tokio的net就行
+第二步要把仅是一个bin的kvs-client设计成一个真正的Client类，并提供对应的API
+
+    Client::get(&mut self, key: String) -> Box<Future<Item = Option<String>, Error = Error>
+    Client::get(&mut self, key: String) -> future::SomeExplicitCombinator<...>
+    Client::get(&mut self, key: String) -> impl Future<Item = Option<String>, Error = Error>
+    Client::get(&mut self, key: String) -> ClientGetFuture
+
+**untenable** 是啥？
+
+##### ThreadPool需要sharable？KvsEngine需要变成future?
+第二步是因为需要用await实现协程访问
+第一步是因为KvServer需要使用线程池去spawn新的读/写任务
+
+##### 把KvsEngine丢到tokio runtime里面去
+
+
+
+##### 关于惊群效应的一些解决思路
+Semaphore被deprecate了，
+
+伪代码：
+    consumer:
+        std::this_thread::wait_for(&cond, longest_dur);
+
+    producer:
+        std::this_thread::notify_all(&cond);
+
+
+不能用锁，lock必定不合语义
+Park看似诱人但仍然不能用，因为Parker和Unparker均只能Send不能Sync，且Parker不能Clone。换句话说，Park看似是一对一的原语，不适用于wake up all的语义。另一点，即使使用一对一的语义，把Unparker收集起来，也要给每个阻塞的任务均Unpark一遍，如果涉及到系统调用的话，开销估计不比简单的使用CondVar触发的惊群效应低。更不用说Park的实现看起来像是自旋实现。
+
+https://man7.org/linux/man-pages/man7/sem_overview.7.html
+系统调用的Semphore也因为接口（增1/减1）而不能直接使用
+
+
+XDM，我用条件变量的时候遇到了个场景。标准库要求使用CondVar的时候需要用一个Mutex去保证唤醒不会丢失，类似于这样：
+
+bool start = false;
+pthread_mutex_t mu;
+pthread_cond_t cond;
+
+thread th = [&mu, &cond]{
+    std::time::sleep(1);
+    {
+        MutexGuard guard = mu.lock();
+        start = true;
+    }
+    cond.notify_all();
+};
+
+pthread_start(th);
+
+mu.lock();
+while (!start) {
+    cond.wait(&mu);
+    mu.lock();
+}
+
+这样可能会在唤醒的时候触发惊群效应，导致大量的线程刚刚被唤醒又因为竞争mu被迫阻塞了。正常来说这样开销是无需理会的，但在我的情景里，
+
+条件变量可以做到，但条件变量必须配合Mutex一起使用保证唤醒不丢失，这可能会导致notify_all的时候竞争Mutex降低性能，这个损失我不太想接受，因为我只想要一个等待-唤醒的语义
+
+最终决定使用busy loop，适时调整sleep time吧，不想自己搓轮子。
+
+
+2022-06-11
+Client基本完工了，接下来是准备Server和Engine
+个人猜测异步不会使Engine的性能得到什么提升，因为基本都是内存操作，没有用到任何异步IO库，且page fault会阻塞所有的进度...
+Server和Engine需要两套thread-pool、两套runtime...这些thread间要怎么交互呢？回调 or channel?
+有时间仿照leveldb试试双缓冲？不过得先去perf看一下memtable的诡异嗲坡度，居然是内存操作最浪费时间？
+
+思考了一下，也许能做到全lock free？不需要pin了，flush-pin的时候只需要sleep一下就行？
+不行，必须保证从memtable中取到rid之后，rid对应的文件一直活着，可以修改一下文件的定义，去这样做：
+
+    loop {
+        match self.memtable.get(key) {
+            None => {
+                return Ok(None)
+            }
+
+            MemtableValue::ValueStr(value) => {
+                return Ok(Some(value))
+            }
+
+            MemtableValue::RID(rid) => {
+                let pin_guard = self.pin_file(rid);
+                if pin_guard.is_none() {
+                    continue;
+                }
+                // rid对应的SSTable已经被pin住，不会被bg_compact线程给删除掉
+                self.read_from_sstable(rid);
+                // pin_guard被drop，对应SSTable的引用计数减1
+            }
+        }
+    }
+
+retry-until-success的确是lock-free编程里很好用的一套方案
+
+
+重新思考下俩池子的设计，就假装那是个异步的IO接口
+感觉并不是开个池子，而是开两个runtime，一个runtime不停的spawn handle_conn，另一个runtime不停地spawn engine？
+
+2022-06-12
+不知道crossbeam中的mpmc能不能保证公平丢任务，如果一个线程在做任务，但有一个任务丢到了它身上，就拉长了平均等待时间
+
+.await时，实际上是对一个future进行了poll_ready；如果poll_ready失败，那么future可能需要被move给其他线程。又由于上述关系，future必须保留await点时的上下文信息（例如栈/堆上的变量）。总而言之，**只有future中所有的上下文均是Send的，那么future才是Send的。如果future不Send，就不能被异步实现**。
+AsyncKvServer必须是Sync的。因为AsyncKvServer提供的是异步函数接口，借用了&self，在这里await时会强制要求&self可以Move，即要求AsyncKvServer必须Sync。
+
+
+后面要做的事：
+打Bench，绘制火焰图，看看速度慢的原因；
+双缓冲 + delay delete，回顾一下leveldb的双缓冲是怎么实现的；
+看看lockfree::Map的源码，了解一下lockfree是怎么实现的；
+将serialize、deserialize的过程也实现shallow copy
+了解一下tokio的实现，顺便加深一下lifetime specifier的理解
+
+
+写成blog，把知识固化下来
+
+2022-06-14
+线程池要求函数是FnOnce + Send + static'。前两个好理解，第三个是因为必须保证闭包捕获的所有成员合法，因为线程根本不知道什么时候会创建、什么时候会调度。
+
+闭包的生命周期应该是只与其捕获的变量有关，或者内部触发了更加精确的条件。
+the parameter type `R` may not live long enough
+...so that the type `[closure@src/engines/kv/async_store.rs:50:25: 53:10]` will meet its required lifetime bounds...
+注意到是type may not live long enough，不是variable
+
+
+engine独立配置线程池接收读/写任务，与多线程直接访问engine，哪个好？
+对于这个项目来说，我感觉后者远好于前者，因为读的内容非常少，每次读完都需要额外引入一次唤醒操作，这个操作的消耗大概率能抵消掉专用读线程指令/数据cache所带来的优势。
+
+如果希望使用异步IO带来的优势，按照我的推论，异步IO需要尽可能做到不陷入内核。
+又开始迷惑了，感觉说不出异步的优势了
+
+
+2022-06-15
+老问题，自身实现了clone trait则难以实现drop trait。或者说，如何实现shallow destruct 和 deep destruct.
+解决方案已经有了：
+问题描述：由于线程的调度时机是不可知的，因此闭包捕获变量时，要么获得其所有权，要么要求变量的生命周期为'static，要么要使用“共享所有权”类语义。
+
+    #[derive(Clone)]
+    pub struct KvStore {
+        inner: Arc<KvStoreInner>,
+    }
+
+    impl Drop for KvStore {
+
+    }
+
+
+在原项目中，每个KvStore都会spawn一个后台线程，这个线程会周期调用KvStoreInner中的一个`bg_flush_compaction_loop()`函数。根据前文分析可知，为实现这一点，要将KvStoreInner包裹在Arc下，然后move给后台线程，类似如下代码：
+
+    pub fn new() -> KvStore {
+        let inner = Arc::new(KvStoreInner::new());
+        let inner2 = inner.clone();
+        std::thread::spawn(move || inner2.bg_flush_compaction_loop());
+        return KvStore { inner }
+    }
+
+    impl Drop for KvStore {
+        fn drop(&mut self) {
+            ...
+        }
+    }
+
+    // shallow copy
+    impl Clone for KvStore {
+        fn clone(&self) -> Self {
+            ...
+        }
+    }
+
+这样，每个inner的引用计数至少是2。在显式drop KvStore时，inner的引用计数只会降至1，无法完成inner中资源的清理。一种思路可能是在KvStore被Drop时，先唤醒后台线程并等待后台线程退出，使inner的引用计数降至1，这样待KvStore的Drop函数执行完毕后，KvStoreInner的Drop就会被执行：
+    impl Drop for KvStore {
+        fn drop(&mut self) {
+            wake up background thread and wait for background thread exit...
+        }
+    }
+
+上述策略同样不能采用，因为KvStore有Clone Trait，且KvStore是Shallow Copy，这样每次Drop一个KvStore时，无法判断是否有其他线程还在使用KvStoreInner，如果有的话，就必须保留后台线程。
+
+这里我在KvStore中引入了一个DropGuard，这使得DropGuard的引用计数与KvStore的Shallow Copy个数一致。当最后一个KvStore的Shallow Copy被drop时，会触发DropGuard的drop函数，在这个drop函数中杀掉后台线程是安全的，因为此时的KvStore是无法访问的。

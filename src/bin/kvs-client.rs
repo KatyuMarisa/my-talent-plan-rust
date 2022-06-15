@@ -1,11 +1,13 @@
-use std::net::TcpStream;
 use std::process::exit;
 
 use clap::{crate_version, crate_authors, command, Command, Arg};
-use kvs::{Result};
-use kvs::{Reply, Request};
 
-fn main() -> Result<()> {
+use kvs::{Request, KvsError, Client};
+type Result<T> = std::result::Result<T, KvsError>;
+
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let matches = command!()
         .author(crate_authors!())
         .version(crate_version!())
@@ -72,6 +74,7 @@ fn main() -> Result<()> {
 
     let req: Request;
     let addr: &str;
+    let mut is_get: bool = false;
 
     match matches.subcommand() {
         Some(("set", sub_matches)) => {
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
             req = Request::GET {
                 key: sub_matches.value_of("key").unwrap().to_owned(),
             };
+            is_get = true;
             addr = sub_matches.value_of("dst").unwrap();
         }
 
@@ -99,24 +103,19 @@ fn main() -> Result<()> {
         _ => { unreachable!() }
     }
 
-    let conn = TcpStream::connect(addr)?;
-    bincode::serialize_into(&conn, &req)?;
-    let reply: Reply = bincode::deserialize_from(&conn)?;
-
+    let mut cli = Client::new(addr).await?;
+    let reply = cli.ping_pong(req).await?;
     match reply {
-        Ok(opt) => {
-            if let Request::GET{key: _} = req {
-                match opt {
-                    Some(value) => { println!("{}", value); }
-                    None => { println!("Key not found") }
-                }
+        Ok(reply) => {
+            if is_get && reply.is_none() {
+                println!("Key not found");
             }
         }
+
         Err(err) => {
             eprintln!("{}", err);
             exit(1);
         }
     }
-
     Ok(())
 }

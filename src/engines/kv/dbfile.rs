@@ -248,6 +248,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn close(self) -> Result<()> {
         drop(self.file);
         Ok(())
@@ -309,10 +310,10 @@ pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader 
 pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Send + Sync { }
 
 pub const HEADER_LENGTH: u8 = 24;
-// pub const FILE_SIZE_LIMIT: usize = 1 << 20;
-pub const FILE_SIZE_LIMIT: usize = 1 << 10; // For Test Only
+pub const FILE_SIZE_LIMIT: usize = PAGE_SIZE * PAGES_PER_FILE;
+// pub const FILE_SIZE_LIMIT: usize = 1 << 10; // For Test Only
 const PAGE_SIZE: usize = 1 << 12;
-const PAGES_PER_FILE: usize = FILE_SIZE_LIMIT / PAGE_SIZE;
+const PAGES_PER_FILE: usize = 256;
 
 #[cfg(test)]
 mod dbfile_unit_tests {

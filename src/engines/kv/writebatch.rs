@@ -1,8 +1,11 @@
-use std::{sync::{Mutex, Arc}, collections::{HashSet, HashMap}};
-
 use crate::{Result, KvError};
 
-use super::{manifest::{FileId, Manifest, RID}, kvfile::{KVFile, KVSSTable, KVRecord}, dbfile::{Appendable, Pos, FILE_SIZE_LIMIT, Readable, DefaultHeader}, kvstore::Statuts};
+use super::manifest::*;
+use super::kvfile::{KVFile, KVSSTable};
+use super::dbfile::{Appendable, FILE_SIZE_LIMIT};
+use super::inner::Statuts;
+
+use std::{sync::{Mutex, Arc}, collections::{HashSet, HashMap}};
 
 pub struct WriteBatch {
     manifest: Arc<Mutex<Manifest>>,
@@ -84,6 +87,7 @@ impl WriteBatch {
     // TODO: It's useless to remove file to avoid data flush because data flush is guarented
     // to happen when `Mmap` is droped.
     // TODO: Maybe use anaonymous Mmap instead?
+    #[allow(dead_code)]
     pub fn abort(self) -> Result<()> {
         let mut manifest_guard = self.manifest.lock().unwrap();
         let remove_fids = self.writers.keys();
@@ -202,6 +206,6 @@ mod writebatch_unit_test {
 
     use tempfile;
 
-    use crate::{Result, engines::kv::{manifest::{Manifest, FileId}, kvfile::{KVRecordKind, KVRecord, KVFile}, dbfile::{Appendable, Readable, MmapFile, Storage}, kvstore::Statuts}};
+    use crate::{Result, engines::kv::{manifest::{Manifest, FileId}, kvfile::{KVRecordKind, KVRecord, KVFile}, dbfile::{Appendable, Readable, MmapFile, Storage}, inner::Statuts}};
     use super::WriteBatch;
 }

@@ -12,9 +12,9 @@ pub enum KvError {
     KeyNotFoundError{key: String},
     #[fail(display = "File size exceed.")]
     FileSizeExceed,
-    #[fail(display = "DataBase corrpution")]
+    #[fail(display = "DataBase corrpution.")]
     MaybeCorrput,
-    #[fail(display = "Race")]
+    #[fail(display = "Race.")]
     DataRace,
 }
 

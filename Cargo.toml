@@ -23,6 +23,9 @@ rand = "0.8.5"
 rayon = "1.5.3"
 crossbeam = "0.8.1"
 tokio = "1.19.1"
+async-bincode = "0.7.0"
+futures = "0.3.21"
+async-trait = "0.1.56"
 
 [dev-dependencies]
 assert_cmd = "0.11.0"

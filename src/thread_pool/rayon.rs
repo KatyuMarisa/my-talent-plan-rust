@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use super::ThreadPool;
 
-
+#[derive(Clone)]
 pub struct RayonThreadPool {
-    pool: rayon::ThreadPool,
+    pool: Arc<rayon::ThreadPool>,
 }
 
 impl ThreadPool for RayonThreadPool {
@@ -11,9 +13,11 @@ impl ThreadPool for RayonThreadPool {
         Self: Sized {
         Ok(
             RayonThreadPool {
-                pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(nthreads as usize)
-                .build().unwrap()
+                pool: Arc::new(rayon::ThreadPoolBuilder::new()
+                    .num_threads(nthreads as usize)
+                    .build()
+                    .unwrap()
+                )
             }
         )
     }

@@ -63,10 +63,12 @@ impl Manifest {
         Ok((fid, storage))
     }
 
+    #[allow(dead_code)]
     pub fn remove_file(&mut self, fid: FileId) -> Result<()> {
         self.atomic_add_remove(vec![], vec![fid])
     }
 
+    #[allow(dead_code)]
     pub fn validate_file(&mut self, fid: FileId) -> Result<()> {
         self.atomic_add_remove(vec![fid], vec![])
     }

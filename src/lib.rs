@@ -4,10 +4,13 @@ mod errors;
 mod engines;
 mod server;
 mod common;
-pub mod thread_pool;
+mod client;
+mod async_server;
 
-pub use engines::KvStore;
-pub use engines::{KvsEngine, SledKvsEngine};
+pub mod thread_pool;
+pub use engines::{KvStore, SledKvStore, AsyncKvStore, KvsEngine, AsyncKvsEngine};
 pub use errors::{Result, KvError};
-pub use common::{Request, Reply};
+pub use common::{Request, Reply, kv_server_error::KvsError};
 pub use server::KvServer;
+pub use async_server::AsyncKvServer;
+pub use client::Client;

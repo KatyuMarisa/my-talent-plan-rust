@@ -2,7 +2,6 @@
 mod mmap_learn_tests {
     use std::{io::{Read, Write}, fs::{OpenOptions, remove_file}, path::PathBuf};
     use memmap::MmapMut;
-    use lockfree;
 
     #[test]
     fn simple_mmap_test() -> std::io::Result<()> {

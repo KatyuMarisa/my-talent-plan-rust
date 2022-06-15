@@ -4,7 +4,7 @@ mod naive;
 
 use crate::Result;
 
-pub trait ThreadPool {
+pub trait ThreadPool: Clone + Send + Sync + 'static {
     fn new(nthread: u32) -> Result<Self>
     where
         Self: Sized;

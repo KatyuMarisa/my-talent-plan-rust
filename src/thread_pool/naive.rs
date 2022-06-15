@@ -1,5 +1,6 @@
 use super::ThreadPool;
 
+#[derive(Clone)]
 pub struct NaiveThreadPool;
 
 impl ThreadPool for NaiveThreadPool {

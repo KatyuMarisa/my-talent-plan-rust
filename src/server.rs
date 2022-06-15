@@ -4,9 +4,9 @@ use bincode::deserialize_from;
 
 use crate::{KvsEngine, common::{Request, Reply}, Result};
 
-pub struct KvServer< Engine: KvsEngine> {
+pub struct KvServer<Engine: KvsEngine> {
     engine: Engine,
-    ip_addr: String,
+    addr: String,
 }
 
 impl<Engine> KvServer<Engine>
@@ -14,11 +14,11 @@ where
     Engine: KvsEngine
 {
     pub fn new(engine: Engine, ip_addr: String) -> Self {
-        Self { engine, ip_addr }
+        Self { engine, addr: ip_addr }
     }
 
     pub fn run(&mut self) -> Result<()> {
-        let listener = TcpListener::bind(self.ip_addr.to_owned())?;
+        let listener = TcpListener::bind(self.addr.to_owned())?;
         for conn in listener.incoming() {
             self.serve(conn.unwrap())?;
         }
