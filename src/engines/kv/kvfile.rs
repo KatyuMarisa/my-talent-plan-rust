@@ -5,7 +5,7 @@ use super::dbfile::{DefaultHeader, OrdinaryRecord, DataBaseFile, Readable, Appen
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub enum KVRecordKind {
     KV,
-    TOMB,
+    Tomb,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

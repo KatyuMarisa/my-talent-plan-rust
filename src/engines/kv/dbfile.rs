@@ -64,9 +64,8 @@ impl Storage for MmapFile {
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
-        Ok (
-            (&mut self.mmap[offset..offset + data.len()]).copy_from_slice(data)
-        )
+        (&mut self.mmap[offset..offset + data.len()]).copy_from_slice(data);
+        Ok (())
     }
 
     fn sync(&mut self) -> Result<()> {
@@ -180,7 +179,7 @@ where
                 }
             }
         }
-        return Ok(records)
+        Ok(records)
     }
 
     fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]> {
@@ -211,7 +210,7 @@ where
         let start = self.header.get_file_length();
         let data = bincode::serialize(r)?;
         if start + data.len() > FILE_SIZE_LIMIT {
-            return Err(KvError::FileSizeExceed.into())
+            Err(KvError::FileSizeExceed.into())
         } else {
             self.file.write(start, &data)?;
             self.reset_file_length(start + data.len())?;
@@ -222,7 +221,7 @@ where
     fn raw_append(&mut self, data: &[u8]) -> Result<Pos> {
         let start = self.header.get_file_length();
         if start + data.len() > FILE_SIZE_LIMIT {
-            return Err(KvError::FileSizeExceed.into());
+            Err(KvError::FileSizeExceed.into())
         } else {
             self.file.write(start, data)?;
             self.reset_file_length(start + data.len())?;
@@ -288,7 +287,7 @@ impl<const MAGIC: u8> FixSizedHeader for DefaultHeader<MAGIC> {
     }
 
     fn get_file_length(&self) -> usize {
-        return self.file_length
+        self.file_length
     }
 
     fn set_file_length(&mut self, len: usize) {

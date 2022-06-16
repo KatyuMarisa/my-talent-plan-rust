@@ -15,7 +15,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn open(root_dir: impl Into<PathBuf>) -> Result<(Self, Vec<(FileId, Box<dyn Storage>)>)> {
+    pub fn open(root_dir: impl Into<PathBuf>) -> Result<ManifestAllFiles> {
         let mut pb: PathBuf = root_dir.into();
         pb.push("MANIFEST");
         let manifest_file = ManifestFile::open(
@@ -32,7 +32,7 @@ impl Manifest {
         Ok((manifest, files))
     }
 
-    pub fn new(root_dir: impl Into<PathBuf>) -> Result<(Self, Vec<(FileId, Box<dyn Storage>)>)> {
+    pub fn new(root_dir: impl Into<PathBuf>) -> Result<ManifestAllFiles> {
         let mut pb: PathBuf = root_dir.into();
         create_dir_all(&pb)?;
         pb.push("MANIFEST");
@@ -75,12 +75,12 @@ impl Manifest {
 
     pub fn atomic_add_remove(&mut self, added: Vec<FileId>, removed: Vec<FileId>) -> Result<()> {
         for fid in added.iter() {
-            if !self.files.contains(&fid) {
+            if !self.files.contains(fid) {
                 return Err(KvError::MaybeCorrput.into())
             }
         }
         for fid in removed.iter() {
-            if !self.files.contains(&fid) {
+            if !self.files.contains(fid) {
                 return Err(KvError::MaybeCorrput.into());
             }
         }
@@ -110,17 +110,17 @@ impl Manifest {
     }
 
     pub fn all_fids(&self) -> Vec<FileId> {
-        return self.files.iter().map(|it| {*it}).collect();
+        return self.files.iter().copied().collect();
     }
 
     pub fn disk_usage(&self) -> usize {
-        return self.files.len() * FILE_SIZE_LIMIT;
+        self.files.len() * FILE_SIZE_LIMIT
     }
 
     fn init(&mut self) -> Result<Vec<(FileId, Box<dyn Storage>)>> {
         let (mut valid_fids, mut invalid_fids) = (HashSet::<FileId>::new(), HashSet::<FileId>::new());
 
-        let mut max_fid = 0 as FileId;
+        let mut max_fid = 0;
 
         for (_, record) in self.manifest_file.all_records()? {
             for fid in record.added {
@@ -134,7 +134,7 @@ impl Manifest {
         }        
         for fid in invalid_fids.iter() {
             self.remove_file_by_fid(*fid)?;
-            valid_fids.remove(&fid);
+            valid_fids.remove(fid);
         }
 
         let mut files: Vec<(FileId, Box<dyn Storage>)> = Vec::new();
@@ -155,8 +155,9 @@ impl Manifest {
 }
 
 
+type ManifestAllFiles = (Manifest, Vec<(FileId, Box<dyn Storage>)>);
 pub type FileId = u32;
-pub type RID = (FileId, Pos);
+pub type Rid = (FileId, Pos);
 
 mod manifest_file {
     #[derive(Serialize, Deserialize, Debug)]

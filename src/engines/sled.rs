@@ -34,7 +34,7 @@ impl KvsEngine for SledKvStore {
 
     fn remove(&self, key: String) -> Result<()> {
         let tree: &Tree = &self.0;
-        tree.remove(key.to_owned())?.ok_or(KvError::KeyNotFoundError {key})?;
+        tree.remove(&key)?.ok_or(KvError::KeyNotFoundError {key})?;
         tree.flush()?;
         Ok(())
     }

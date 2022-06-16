@@ -29,13 +29,13 @@ impl<E: AsyncKvsEngine> AsyncKvServer<E> {
                     let engine = self.engine.clone();
                     tokio::spawn(async move {
                         if let Err(err) = serve(engine, stream).await {
-                            eprintln!("{}", err.to_string());
+                            eprintln!("serve error: {}", err);
                         }
                     });
                 }
 
                 Err(err) => {
-                    eprintln!("accept error: {}", err.to_string());
+                    eprintln!("accept error: {}", err);
                 }
             }
         }

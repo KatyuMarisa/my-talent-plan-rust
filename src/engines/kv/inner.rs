@@ -49,10 +49,10 @@ impl KvStoreInner {
                     );
 
                     for (pos, record) in reader.all_records()? {
-                        if record.kind == KVRecordKind::TOMB {
+                        if record.kind == KVRecordKind::Tomb {
                             memtable.raw_remove(&record.key);
                         } else {
-                            memtable.raw_set(&record.key, MemtableValue::RID((fid, (pos.0, pos.1))))
+                            memtable.raw_set(&record.key, MemtableValue::Rid((fid, (pos.0, pos.1))))
                         }
                     }
                     sstables.insert(fid, reader);
@@ -82,12 +82,12 @@ impl KvStoreInner {
         root_dir.push("MANIFEST");
         if std::path::Path::new(&root_dir).exists() {
             root_dir.pop();
-            return Self::open(root_dir, bg_cond, state)
+            Self::open(root_dir, bg_cond, state)
         } else {
             root_dir.pop();
             let (manifest, files) = Manifest::new(root_dir)?;
-            assert!(files.len() == 0);
-            return Ok(Self {
+            assert!(files.is_empty());
+            Ok(Self {
                 manifest: Arc::new(Mutex::new(manifest)),
                 memtable: Arc::new(Memtable::new(Self::INIT_FLUSH_LIMIT, bg_cond.clone())),
                 sstables: Arc::new(ThreadSafeMap::new()),
@@ -110,7 +110,7 @@ impl KvStoreInner {
         self.memtable_retry_loop(func, cb)
     }
 
-    pub fn get_from_sstable(&self, rid: &RID) -> Result<Option<String>> {
+    pub fn get_from_sstable(&self, rid: &Rid) -> Result<Option<String>> {
         let (fid, pos) = rid;
         let record = self.sstables
             .get(fid)
@@ -118,10 +118,10 @@ impl KvStoreInner {
             .val()
             .read_record_at(pos.0, pos.1)?;
         
-        if record.kind == KVRecordKind::TOMB {
-            return Ok(None)
+        if record.kind == KVRecordKind::Tomb {
+            Ok(None)
         } else {
-            return Ok(Some(record.value))
+            Ok(Some(record.value))
         }
     }
 
@@ -138,14 +138,14 @@ impl KvStoreInner {
     pub fn get(&self, key: String) -> Result<Option<String>> {
         let value_or_pos = self.get_from_memtable(&key)?;
         match value_or_pos {
-            Some(MemtableValue::RID(rid)) => {
-                return self.get_from_sstable(&rid)
+            Some(MemtableValue::Rid(rid)) => {
+                self.get_from_sstable(&rid)
             }
             Some(MemtableValue::Value(valstr)) => {
-                return Ok(valstr)
+                Ok(valstr)
             }
             None => {
-                return Ok(None)
+                Ok(None)
             }
         }
     }
@@ -242,9 +242,9 @@ impl KvStoreInner {
         let mut disk_usage = self.manifest.lock().unwrap().disk_usage();
 
         let mut state_guard = self.state.lock().unwrap();
-        assert!(*state_guard != State::EXIT);
+        assert!(*state_guard != State::Exit);
         // handle compaction/flush
-        while *state_guard != State::CLOSED {
+        while *state_guard != State::Closed {
             if self.memtable.should_flush() && self.memtable.pin_flush() {
                 (disk_usage, compaction_limit) = self.maybe_flush_or_compact(disk_usage, compaction_limit);
             }
@@ -257,12 +257,12 @@ impl KvStoreInner {
     }
 
     pub fn force_flush(&self) {
-        assert!(*self.state.lock().unwrap() == State::CLOSED);
+        assert!(*self.state.lock().unwrap() == State::Closed);
         self.memtable.stop_and_prepare_flush_memtable();
         self.maybe_flush_or_compact(0, 1);
         {
             let mut state_guard = self.state.lock().unwrap();
-            *state_guard = State::EXIT;
+            *state_guard = State::Exit;
             self.bg_flush_cond.notify_one();
         }
     }
@@ -342,9 +342,9 @@ impl KvStoreInner {
                     rid = batch.append_bytes(&bincode::serialize(&record)?)?;
                 }
 
-                MemtableValue::RID((fid, pos)) => {
+                MemtableValue::Rid((fid, pos)) => {
                     rid = batch.append_bytes(
-                        self.sstables.get(&fid).unwrap().val().raw_read(pos.0, pos.1)?
+                        self.sstables.get(fid).unwrap().val().raw_read(pos.0, pos.1)?
                     )?;
                 }
 
@@ -352,13 +352,13 @@ impl KvStoreInner {
                     let record = KVRecord {
                         key: guard.key().to_owned(),
                         value: "".to_owned(),
-                        kind: KVRecordKind::TOMB
+                        kind: KVRecordKind::Tomb
                     };
                     rid = batch.append_bytes(&bincode::serialize(&record)?)?;
                 }
             }
 
-            self.memtable.raw_set(guard.key(), MemtableValue::RID(rid));
+            self.memtable.raw_set(guard.key(), MemtableValue::Rid(rid));
         }
         stat.num_records += num_records;
         stat.timecost_prepare_and_reset += start.elapsed().as_millis();
@@ -374,7 +374,7 @@ impl Drop for KvStoreInner {
 
 #[derive(PartialEq)]
 pub enum State {
-    RUNNING,
-    CLOSED,
-    EXIT,
+    Running,
+    Closed,
+    Exit,
 }

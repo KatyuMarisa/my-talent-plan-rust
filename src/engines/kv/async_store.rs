@@ -21,7 +21,7 @@ pub struct AsyncKvStore<P: ThreadPool> {
 impl<P: ThreadPool> AsyncKvStore<P> {
     pub fn open(root_dir: impl Into<PathBuf>, nthread: u32) -> Result<Self> {
         let pool = P::new(nthread)?;
-        let state = Arc::new(Mutex::new(State::RUNNING));
+        let state = Arc::new(Mutex::new(State::Running));
         let bg_cond = Arc::new(Condvar::new());
         let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), state.clone())?);
         let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
@@ -35,7 +35,7 @@ impl<P: ThreadPool> AsyncKvStore<P> {
 
     pub fn new(root_dir: impl Into<PathBuf>, nthread: u32) -> Result<Self> {
         let pool = P::new(nthread)?;
-        let state = Arc::new(Mutex::new(State::RUNNING));
+        let state = Arc::new(Mutex::new(State::Running));
         let bg_cond = Arc::new(Condvar::new());
         let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), state.clone())?);
         let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
@@ -54,7 +54,7 @@ impl<P: ThreadPool> AsyncKvStore<P> {
     {
         let (tx, rx) = oneshot::channel();
         self.pool.spawn(move || {
-            if let Err(_) = tx.send(func()) {
+            if tx.send(func()).is_err() {
                 eprintln!("send error")
             }
         });

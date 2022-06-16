@@ -15,10 +15,10 @@ pub struct KvStore {
 impl KvStore {
     pub fn open(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let bg_cond = Arc::new(Condvar::new());
-        let running = Arc::new(Mutex::new(State::RUNNING));
-        let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), running.clone())?);
+        let state = Arc::new(Mutex::new(State::Running));
+        let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), state.clone())?);
         let inner2 = inner.clone();
-        let drop_guard = Arc::new(DropGuard::new(running.clone(), bg_cond.clone()));
+        let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
         std::thread::spawn(move || {
             inner2.bg_flush_compaction_loop();
         });
@@ -31,10 +31,10 @@ impl KvStore {
 
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let bg_cond = Arc::new(Condvar::new());
-        let running = Arc::new(Mutex::new(State::RUNNING));
-        let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), running.clone())?);
+        let state = Arc::new(Mutex::new(State::Running));
+        let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), state.clone())?);
         let inner2 = inner.clone();
-        let drop_guard = Arc::new(DropGuard::new(running.clone(), bg_cond.clone()));
+        let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
         std::thread::spawn(move || {
             inner2.bg_flush_compaction_loop();
         });

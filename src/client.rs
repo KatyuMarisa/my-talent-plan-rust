@@ -20,7 +20,7 @@ impl Client {
     pub async fn get(&mut self, key: String) -> Result<Option<String>> {
         let req = Request::GET { key };
         let reply = self.ping_pong(req).await??;
-        return Ok(reply)
+        Ok(reply)
     }
 
     pub async fn set(&mut self, key: String, value: String) -> Result<()> {

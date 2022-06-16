@@ -33,10 +33,10 @@ impl WriteBatch {
         })
     }
 
-    pub fn append_bytes(&mut self, data: &[u8]) -> Result<RID> { 
+    pub fn append_bytes(&mut self, data: &[u8]) -> Result<Rid> { 
         match self.writers.get_mut(&self.current_fid).unwrap().raw_append(data) {
             Ok(pos) => {
-                return Ok((self.current_fid, pos))
+                Ok((self.current_fid, pos))
             }
 
             Err(err) => {
@@ -46,18 +46,18 @@ impl WriteBatch {
                     self.writers.insert(current_fid, current_writer);
                     self.current_fid = current_fid;
                     self.disk_usage += FILE_SIZE_LIMIT;
-                    return Ok(
+                    Ok(
                         (self.current_fid, self.writers.get_mut(&current_fid).unwrap().raw_append(data)?)
                     )
                 } else {
-                    return Err(err)
+                    Err(err)
                 }
             }
         }
     }
 
     pub fn disk_usage(&self) -> usize {
-        return self.disk_usage;
+        self.disk_usage
     }
 
     pub fn mark_fid_invalid(&mut self, fids: Vec<FileId>) {

@@ -8,8 +8,8 @@ use super::ThreadPool;
 type TaskType = Box<dyn Send + 'static + FnOnce()>;
 
 enum QueueMessageType {
-    TASK(TaskType),
-    SHUTDOWN,
+    Task(TaskType),
+    ShutDown,
 }
 
 #[derive(Clone)]
@@ -41,11 +41,11 @@ fn handle_task(task_guard: TaskGuard) {
     loop {
         if let Ok(msg) = task_guard.receiver.recv() {
             match msg {
-                QueueMessageType::TASK(task) => {
+                QueueMessageType::Task(task) => {
                     task();
                 }
 
-                QueueMessageType::SHUTDOWN => {
+                QueueMessageType::ShutDown => {
                     println!("thread {} exit!", task_guard.tid);
                     break;
                 }
@@ -80,7 +80,7 @@ impl ThreadPool for SharedQueueThreadPool {
     fn spawn<F>(&self, job: F)
     where
         F: Send + 'static + FnOnce() {
-        self.sender.send(QueueMessageType::TASK(Box::new(job)));
+        self.sender.send(QueueMessageType::Task(Box::new(job)));
     }
 }
 
@@ -105,7 +105,7 @@ impl SenderWrapper {
 impl Drop for SenderWrapper {
     fn drop(&mut self) {
         for _ in 0..self.ntask {
-            self.sender.send(QueueMessageType::SHUTDOWN)
+            self.sender.send(QueueMessageType::ShutDown)
                 .expect("send shutdown error!");
         }
     }

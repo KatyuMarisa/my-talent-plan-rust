@@ -18,12 +18,12 @@ impl Drop for DropGuard {
         // let background thread exit.
         {
             let mut state_guard = self.state.lock().unwrap();
-            *state_guard = State::CLOSED;
+            *state_guard = State::Closed;
             self.bg_cond.notify_one();
         }
         // wait for background thread complete flush.
         let mut state_guard = self.state.lock().unwrap();
-        while *state_guard != State::EXIT {
+        while *state_guard != State::Exit {
             state_guard = self.bg_cond.wait(state_guard).unwrap();
         }
     }

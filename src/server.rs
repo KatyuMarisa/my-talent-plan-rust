@@ -55,7 +55,7 @@ where
             }
 
             Err(err) => {
-                Err(format!("{}", err.to_string()))
+                Err(err.to_string())
             }
         };
         bincode::serialize_into(&conn, &reply)?;

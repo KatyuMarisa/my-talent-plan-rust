@@ -1,11 +1,11 @@
 use std::sync::{Condvar, Arc};
-use std::{sync::atomic::AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
 
 use lockfree::map::{Map as LockFreeMap, ReadGuard};
 use lockfree::set::Set as LockFreeSet;
 
-use super::manifest::RID;
+use super::manifest::Rid;
 
 pub struct Memtable {
     map: LockFreeMap<String, MemtableValue>,
@@ -27,7 +27,7 @@ pub enum MemtableState {
 
 #[derive(Clone, Debug)]
 pub enum MemtableValue {
-    RID(RID),
+    Rid(Rid),
     Value(Option<String>),
 }
 
@@ -55,12 +55,12 @@ impl Memtable {
         match self.map.get(&key) {
             Some(v) => {
                 self.unpin_read_write();
-                return (MemtableState::Ok, Some(v.val().clone()))
+                (MemtableState::Ok, Some(v.val().clone()))
             }
 
             None => {
                 self.unpin_read_write();
-                return (MemtableState::Ok, None)
+                (MemtableState::Ok, None)
             }
         }
     }
@@ -83,7 +83,7 @@ impl Memtable {
         if size_after >= self.flush_limit {
             self.wake_up_flush();
         }
-        return MemtableState::Ok
+        MemtableState::Ok
     }
 
     pub fn remove(&self, key: String) -> MemtableState {
@@ -122,10 +122,10 @@ impl Memtable {
 
         if key_found {
             self.unpin_read_write();
-            return MemtableState::Ok
+            MemtableState::Ok
         } else {
             self.unpin_read_write();
-            return MemtableState::KeyNotExist(key)
+            MemtableState::KeyNotExist(key)
         }
     }
 
@@ -168,7 +168,7 @@ impl Memtable {
     }
 
     pub fn should_flush(&self) -> bool {
-        return self.uncompacted.load(Acquire) >= self.flush_limit;
+        self.uncompacted.load(Acquire) >= self.flush_limit
     }
 
     pub fn pin_flush(&self) -> bool {
@@ -178,8 +178,8 @@ impl Memtable {
                 return false;
             }
  
-            if let Ok(_) = self.pin_count.compare_exchange(pin, pin + Self::PINCOUNT_FLUSH,
-                Acquire, Relaxed) {
+            if self.pin_count.compare_exchange(pin, pin + Self::PINCOUNT_FLUSH,
+                Acquire, Relaxed).is_ok() {
                 // We have block all succeed read/write requests. Now we are waiting for remaining requests to finish.
                 loop {
                     assert!(self.pin_count.load(Relaxed) >= Self::PINCOUNT_FLUSH);
@@ -224,13 +224,13 @@ impl Memtable {
                 return MemtableState::AccessRace;
             }
             let pin = self.pin_count.load(Acquire);
-            if pin >= Self::PINCOUNT_FLUSH && pin < Self::PINCOUNT_COMPACTION {
+            if (Self::PINCOUNT_FLUSH..Self::PINCOUNT_COMPACTION).contains(&pin) {
                 return MemtableState::FlushRace;
             } else if pin >= Self::PINCOUNT_COMPACTION {
                 return MemtableState::CompactionRace;
             }
 
-            if let Ok(_) = self.pin_count.compare_exchange(pin, pin + 1, Acquire, Relaxed) {
+            if self.pin_count.compare_exchange(pin, pin + 1, Acquire, Relaxed).is_ok() {
                 return MemtableState::Ok;
             } else {
                 // nothing to do.
