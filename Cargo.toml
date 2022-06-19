@@ -4,9 +4,6 @@ version = "0.1.0"
 authors = ["yukari"]
 edition = "2018"
 
-[env]
-RUST_BACKTRACE="full"
-
 [dependencies]
 clap = { version = "3.1.12", features = ["derive", "cargo"] }
 assert_cmd = "0.11.0"
@@ -27,6 +24,10 @@ async-bincode = "0.7.0"
 futures = "0.3.21"
 async-trait = "0.1.56"
 
+[[bench]]
+name = "kvs-bench"
+harness = false
+
 [dev-dependencies]
 assert_cmd = "0.11.0"
 predicates = "1.0.0"
@@ -34,6 +35,6 @@ tempfile = "3.0.7"
 walkdir = "2.2.7"
 sled = "0.34.6"
 panic-control = "0.1.4"
-criterion = "0.2.11"
+criterion = "0.3"
 crossbeam-utils = "0.6.5"
 tokio = {version = "1.19.1", features = ["full"]}

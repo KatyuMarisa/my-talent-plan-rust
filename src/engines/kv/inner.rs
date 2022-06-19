@@ -25,7 +25,7 @@ pub struct KvStoreInner {
 
 impl KvStoreInner {
     const INIT_FLUSH_LIMIT: usize = FILE_SIZE_LIMIT * 2;
-    const INIT_COMPACT_LIMIT: usize = FILE_SIZE_LIMIT * 4;
+    const INIT_COMPACT_LIMIT: usize = 5 * FILE_SIZE_LIMIT * 20;
 
     pub fn open(root_dir: impl Into<PathBuf>, bg_cond: Arc<Condvar>, state: Arc<Mutex<State>>) -> Result<Self> {
         let (manifest, mut files) = Manifest::open(root_dir)?;
@@ -65,7 +65,7 @@ impl KvStoreInner {
             }
         }
 
-        compaction_limit = compaction_limit * 3 / 2;
+        compaction_limit = std::cmp::max(compaction_limit * 3 / 2, Self::INIT_COMPACT_LIMIT);
         let res = KvStoreInner {
             manifest: Arc::new(Mutex::from(manifest)),
             memtable: Arc::new(memtable),
@@ -199,14 +199,14 @@ impl KvStoreInner {
                 (MemtableState::FlushRace, _) => {
                     // wakeup may lost, so we set a timeout
                     // _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_millis(100));
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(3));
                     flush_race_retry += 1;
                 }
 
                 (MemtableState::CompactionRace, _) => {
                     // wakeup may lost, so we set a timeout
                     // _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_secs(100));
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     compaction_race_retry += 1;
                 }
 
@@ -272,33 +272,37 @@ impl KvStoreInner {
         let force_flush = compaction_limit == 1;
         stat.kind = "Flush".to_string();
         // try to flush first...
+        // flush all flushable records to dist
         let mut batch = WriteBatch::new(self.manifest.clone()).expect("create WriteBatch error");
-        let start_travel_records = std::time::Instant::now();
-        let records = self.memtable.take_all_flushable();
-        stat.timecost_get_values += start_travel_records.elapsed().as_millis();
-        stat.bytes_size += batch.disk_usage();
-        self.write_to_batch(&mut batch, records, &mut stat).expect("write to WriteBatch error");
+        self.flush_and_reset_rids(&mut batch,
+            self.memtable.take_all_flushable(),
+            &mut stat)
+            .expect("write to WriteBatch error");
         let batch_disk_usage = batch.disk_usage();
         disk_usage += batch_disk_usage;
+        // commit batch and create new fid->sstable mapping.
         let filemap = batch.commit(&mut stat).expect("batch commit error");
         self.sstables.extend(filemap);
         println!("disk_usage: {}, batch_disk_usage: {}, compaction_limit: {}", disk_usage, batch_disk_usage, compaction_limit);
         if disk_usage <= compaction_limit || force_flush {
+            // doesn't trigger compaction, so only flush is ok.
             self.memtable.unpin_flush();
         } else {
-            // compaction is a very heavy operation, so we block spin-read/write operations to save cpu cycles.
+            // trigger compaction...
+            // TODO: Multi Flush Buffer + Delay Delete to ensure read/write non-block.
             stat.kind = "Compaction".to_string();
             self.memtable.pin_compaction();
-            // trigger compaction
             let before_fids = self.manifest.lock().unwrap().all_fids();
             batch = WriteBatch::new(self.manifest.clone()).expect("create WriteBatch error");
-            let start_travel_records = std::time::Instant::now();
-            let records = self.memtable.take_all();
-            stat.timecost_get_values += start_travel_records.elapsed().as_millis();
-            self.write_to_batch(&mut batch, records, &mut stat).expect("write to WriteBatch error");
+            self.flush_and_reset_rids(
+                &mut batch,
+                self.memtable.take_all(),
+                &mut stat)
+                .expect("write to WriteBatch error");
+            // after compaction, all previous fids is invalid.
             batch.mark_fid_invalid(before_fids);
             stat.bytes_size += batch.disk_usage();
-            // 
+            // commit all changes.
             let filemap = batch.commit(&mut stat).expect("batch commit error");
             self.sstables.extend(filemap);
             // adjust compaction_limit
@@ -308,10 +312,9 @@ impl KvStoreInner {
             // only small portion of records is duplicate, so we expand compaction_limit.
             if disk_usage * 12 / 10 >= prev_disk_usage {
                 compaction_limit = 2 * prev_disk_usage;
-            } else if disk_usage < prev_disk_usage / 4 && compaction_limit > 20 * FILE_SIZE_LIMIT {
+            } else if disk_usage < prev_disk_usage / 2 && compaction_limit > 2 * Self::INIT_COMPACT_LIMIT  {
                 // most of records is duplicate, so we shrink compaction_limit.
-                compaction_limit = prev_disk_usage / 2;
-                // println!("adjust compaction_limit to {}", compaction_limit);
+                compaction_limit = prev_disk_usage * 2 / 3;
             }
             self.memtable.unpin_compaction();
             self.memtable.unpin_flush();
@@ -322,14 +325,54 @@ impl KvStoreInner {
 
     // TODO: return reference to avoid deep copy.
     // TODO: maybe sort by FileId to make this function more cache friendly.
-    fn write_to_batch<'a>(&self, batch: &mut WriteBatch, entries: impl Iterator<Item = ReadGuard<'a, String, MemtableValue>>,
+    fn flush_and_reset_rids<'a>(&self, batch: &mut WriteBatch, entries: impl Iterator<Item = ReadGuard<'a, String, MemtableValue>>,
             stat: &mut Statuts) -> Result<()> {
+        // sort to make programm more cache-friendly.
+        let mut records = entries.collect::<Vec::<_>>();
+        records.sort_by(|a, b| {
+            match (a.val(), b.val()) {
+                (MemtableValue::Value(aa), MemtableValue::Value(bb)) => {
+                    match (aa, bb) {
+                        (None, None) => {
+                            std::cmp::Ordering::Equal
+                        }
+                        (None, Some(_)) => {
+                            std::cmp::Ordering::Less
+                        },
+                        (Some(_), None) => {
+                            std::cmp::Ordering::Greater
+                        }
+                        (Some(aa), Some(bb)) => {
+                            aa.cmp(bb)
+                        },
+                    }
+                }
+
+                (MemtableValue::Rid(_), MemtableValue::Value(_)) => {
+                    std::cmp::Ordering::Greater
+                },
+
+                (MemtableValue::Value(_), MemtableValue::Rid(_)) => {
+                    std::cmp::Ordering::Less
+                },
+
+                (MemtableValue::Rid(aa), MemtableValue::Rid(bb)) => {
+                    let (a_fid, (a_offset, _)) = aa;
+                    let (b_fid, (b_offset, _)) = bb;
+                    if a_fid != b_fid {
+                        a_fid.cmp(b_fid)
+                    } else {
+                        a_offset.cmp(b_offset)
+                    }
+                }
+            }
+        });
 
         let mut rid;
         let start = std::time::Instant::now();
         let mut num_records = 0;
 
-        for guard in entries {
+        for guard in records {
             num_records += 1;
 
             match guard.val() {
@@ -344,7 +387,10 @@ impl KvStoreInner {
 
                 MemtableValue::Rid((fid, pos)) => {
                     rid = batch.append_bytes(
-                        self.sstables.get(fid).unwrap().val().raw_read(pos.0, pos.1)?
+                        self.sstables
+                            .get(fid).unwrap()
+                            .val()
+                            .raw_read(pos.0, pos.1)?
                     )?;
                 }
 

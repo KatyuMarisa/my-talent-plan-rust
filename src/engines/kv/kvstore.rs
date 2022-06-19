@@ -19,9 +19,7 @@ impl KvStore {
         let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), state.clone())?);
         let inner2 = inner.clone();
         let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
-        std::thread::spawn(move || {
-            inner2.bg_flush_compaction_loop();
-        });
+        std::thread::spawn(move || inner2.bg_flush_compaction_loop());
 
         Ok(Self {
             inner,
@@ -35,9 +33,7 @@ impl KvStore {
         let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), state.clone())?);
         let inner2 = inner.clone();
         let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
-        std::thread::spawn(move || {
-            inner2.bg_flush_compaction_loop();
-        });
+        std::thread::spawn(move || inner2.bg_flush_compaction_loop());
 
         Ok(Self {
             inner,

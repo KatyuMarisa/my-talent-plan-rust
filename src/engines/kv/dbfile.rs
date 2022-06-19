@@ -312,7 +312,7 @@ pub const HEADER_LENGTH: u8 = 24;
 pub const FILE_SIZE_LIMIT: usize = PAGE_SIZE * PAGES_PER_FILE;
 // pub const FILE_SIZE_LIMIT: usize = 1 << 10; // For Test Only
 const PAGE_SIZE: usize = 1 << 12;
-const PAGES_PER_FILE: usize = 256;
+const PAGES_PER_FILE: usize = 1 << 8;
 
 #[cfg(test)]
 mod dbfile_unit_tests {
