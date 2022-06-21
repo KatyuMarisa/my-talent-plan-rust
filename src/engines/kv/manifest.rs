@@ -1,11 +1,13 @@
 use std::collections::{HashSet};
-use std::fs::{create_dir_all};
-use std::path::{PathBuf};
+use std::fs::create_dir_all;
+use std::path::PathBuf;
 
-use manifest_file::{ManifestFile, ManifestRecord};
 use crate::Result;
-use super::dbfile::{Storage, MmapFile, Readable, Appendable, Pos, FILE_SIZE_LIMIT};
 use crate::errors::KvError;
+
+use super::disk::{
+    ManifestFile, Storage, MmapFile, ManifestRecord, FILE_SIZE_LIMIT, Pos, Readable, Appendable,
+};
 
 pub struct Manifest {
     next_fid: FileId,
@@ -19,7 +21,8 @@ impl Manifest {
         let mut pb: PathBuf = root_dir.into();
         pb.push("MANIFEST");
         let manifest_file = ManifestFile::open(
-            Box::new(MmapFile::open(&pb)?))?;
+            Box::new(MmapFile::open(&pb)?)
+        )?;
         pb.pop();
         let mut manifest = Manifest {
             next_fid: 1,
@@ -29,6 +32,7 @@ impl Manifest {
         };
 
         let files = manifest.init()?;
+
         Ok((manifest, files))
     }
 
@@ -37,7 +41,8 @@ impl Manifest {
         create_dir_all(&pb)?;
         pb.push("MANIFEST");
         let manifest_file = ManifestFile::init(
-            Box::new(MmapFile::new(&pb)?))?;
+            Box::new(MmapFile::new(&pb)?)
+        )?;
         pb.pop();
         let mut manifest = Manifest {
             next_fid: 1,
@@ -51,16 +56,43 @@ impl Manifest {
         Ok((manifest, files))
     }
 
-    pub fn create_file(&mut self) -> Result<(FileId, Box<dyn Storage>)> {
+    pub fn create_file<FileType: Storage>(&mut self) -> Result<(FileId, Box<FileType>)> {
         let name = self.filename(self.next_fid);
         let fid = self.next_fid;
 
-        let storage = Box::new(
-            MmapFile::new(PathBuf::from(name))?
-        );
-        self.files.insert(fid);
-        self.next_fid += 1;        
-        Ok((fid, storage))
+        // let storage = Box::new(
+        //     FileType::new(PathBuf::from(name))?
+        // );
+        // self.files.insert(fid);
+        // self.next_fid += 1;
+        // Ok((fid, storage))
+        match FileType::new(PathBuf::from(&name)) {
+            Err(err) => {
+                println!("create file at {} error: {}", name, err.to_string());
+                println!("does path exist? {}", self.root.as_path().exists());
+                println!("next_fid: {}, fids: {:?}", self.next_fid, self.all_fids());
+                return Err(err)
+            }
+            Ok(storage) => {
+                let storage = Box::new(storage);
+                self.files.insert(fid);
+                self.next_fid += 1;
+                Ok((fid, storage))
+            }
+        }
+
+        // let storage = Box::new(
+        //     FileType::new(PathBuf::from(name))?
+        // );
+        // self.files.insert(fid);
+        // self.next_fid += 1;        
+        // Ok((fid, storage))
+    }
+
+    pub fn open_file<FileType: Storage>(&mut self, fid: FileId) -> Result<Box<FileType>> {
+        assert!(self.files.contains(&fid));
+        let pb = PathBuf::from(self.filename(fid));
+        Ok(Box::new(FileType::open(&pb)?))
     }
 
     #[allow(dead_code)]
@@ -74,16 +106,9 @@ impl Manifest {
     }
 
     pub fn atomic_add_remove(&mut self, added: Vec<FileId>, removed: Vec<FileId>) -> Result<()> {
-        for fid in added.iter() {
-            if !self.files.contains(fid) {
-                return Err(KvError::MaybeCorrput.into())
-            }
-        }
-        for fid in removed.iter() {
-            if !self.files.contains(fid) {
-                return Err(KvError::MaybeCorrput.into());
-            }
-        }
+        // all allocated fids should be tracked...
+        assert!(added.iter().all(|fid| self.files.contains(fid)));
+        assert!(removed.iter().all(|fid| self.files.contains(fid)));
 
         self.manifest_file.append_record(
             &ManifestRecord {
@@ -158,21 +183,3 @@ impl Manifest {
 type ManifestAllFiles = (Manifest, Vec<(FileId, Box<dyn Storage>)>);
 pub type FileId = u32;
 pub type Rid = (FileId, Pos);
-
-mod manifest_file {
-    #[derive(Serialize, Deserialize, Debug)]
-    pub struct ManifestRecord {
-        pub added: Vec<FileId>,
-        pub removed: Vec<FileId>,
-    }
-
-    impl OrdinaryRecord for ManifestRecord {  }
-    pub type ManifestFile = DataBaseFile<DefaultHeader<MAGIC_MANIFEST>, ManifestRecord>;
-    pub const MAGIC_MANIFEST: u8 = 0;
-
-    use super::FileId;
-    use serde::{Serialize, Deserialize};
-    use crate::engines::kv::dbfile::OrdinaryRecord;
-    use crate::engines::kv::dbfile::{DataBaseFile, DefaultHeader};
-}
-

@@ -1,120 +1,8 @@
-use std::fs::{create_dir_all, OpenOptions, remove_file};
-use std::path::PathBuf;
+use crate::{KvError, Result};
+
+use super::{files_truct::{OrdinaryHeader, OrdinaryRecord, Readable, Pos, Appendable}, Storage, FILE_SIZE_LIMIT};
+
 use std::marker::PhantomData;
-use std::fmt::Debug;
-
-use memmap::MmapMut;
-use serde::Deserialize;
-use serde::{Serialize, de::DeserializeOwned};
-use bincode::{serialize, deserialize, deserialize_from as deserialize_stream};
-
-use crate::errors::{Result, KvError};
-
-pub trait Storage: Sync + Send {
-    fn new(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
-    fn open(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized;
-    fn read(&self, offset: usize, length: usize) -> Result<&[u8]>;
-    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()>;
-    fn sync(&mut self) -> Result<()>;
-    fn close(self) -> Result<()>;
-    fn remove(self) -> Result<()>;
-}
-
-pub struct MmapFile {
-    mmap: memmap::MmapMut,
-    path: PathBuf,
-}
-
-impl Storage for MmapFile {
-    fn open(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized {
-        let pb: PathBuf = path.into();
-        let f = OpenOptions::new()
-            .create(false)
-            .read(true)
-            .write(true)
-            .open(&pb)?;
-
-        Ok (Self{
-            mmap: unsafe { MmapMut::map_mut(&f)? },
-            path: pb
-        })
-    }
-
-    fn new(path: impl Into<PathBuf>) -> Result<Self> where Self: Sized {
-        let pb: PathBuf = path.into();
-        create_dir_all(pb.parent().expect("invalid path"))?;
-        let f = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&pb)?;
-
-        f.set_len(FILE_SIZE_LIMIT as u64)?;
-        Ok(Self{
-            mmap: unsafe { MmapMut::map_mut(&f)? },
-            path: pb
-        })
-        
-    }
-
-    fn read(&self, offset: usize, length: usize) -> Result<&[u8]> {
-        Ok (
-            &self.mmap[offset..offset + length]
-        )
-    }
-
-    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
-        (&mut self.mmap[offset..offset + data.len()]).copy_from_slice(data);
-        Ok (())
-    }
-
-    fn sync(&mut self) -> Result<()> {
-        Ok (
-            self.mmap.flush()?
-        )
-    }
-
-    fn remove(self) -> Result<()> {
-        Ok (
-            remove_file(self.path)?
-        )
-    }
-
-    fn close(self) -> Result<()> {
-        drop(self.mmap);
-        Ok(())
-    }
-}
-
-pub trait Readable<Header, Record>: Sync + Send
-where
-    Header: OrdinaryHeader,
-    Record: OrdinaryRecord
-{
-    fn open(file: Box<dyn Storage>) -> Result<Self> where Self: Sized;
-    fn read_record_at(&self, offset: usize, length: usize) -> Result<Record>;
-    fn all_records(&self) -> Result<Vec<(Pos, Record)>>;
-    fn raw_read(&self, offset: usize, length: usize) -> Result<&[u8]>;
-}
-
-pub trait Appendable<Header, Record>
-where
-    Header: OrdinaryHeader,
-    Record: OrdinaryRecord
-{
-    fn init(file: Box<dyn Storage>) -> Result<Self> where Self: Sized;
-    fn append_record(&mut self, r: &Record) -> Result<Pos>;
-    fn raw_append(&mut self, data: &[u8]) -> Result<Pos>;
-    fn sync(&mut self) -> Result<()>;
-}
-
-pub trait ReadableAppendable<H, R>: Readable<H, R> + Appendable<H, R>
-where
-    H: OrdinaryHeader,
-    R: OrdinaryRecord
-{ }
-
-pub type Pos = (usize, usize);
 
 pub struct DataBaseFile<Header, Record>
 where
@@ -132,7 +20,7 @@ where
     Record: OrdinaryRecord
 {
     fn open(file: Box<dyn Storage>) -> Result<Self> where Self: Sized {
-        let header = deserialize(file.read(0, Header::header_length())?)?;
+        let header = bincode::deserialize(file.read(0, Header::header_length())?)?;
         let result = Self{
             file,
             header,
@@ -142,9 +30,7 @@ where
     }
 
     fn read_record_at(&self, offset: usize, length: usize) -> Result<Record> {
-        Ok (
-            deserialize(self.file.read(offset, length)?)?
-        )
+        Ok (bincode::deserialize(self.file.read(offset, length)?)?)
     }
 
     fn all_records(&self) -> Result<Vec<(Pos, Record)>> {
@@ -155,7 +41,7 @@ where
         );
         let mut offset = 0;
         loop {
-            match deserialize_stream(&mut cursor) {
+            match bincode::deserialize_from(&mut cursor) {
                 Ok(record) => {
                     let prev = offset;
                     offset = cursor.position() as usize;
@@ -202,7 +88,7 @@ where
         };
 
         res.reset_file_length(Header::header_length())?;
-        res.sync()?;
+        // TODO: Avoid needless sync.
         Ok(res)
     }
 
@@ -246,73 +132,18 @@ where
         self.header.set_file_length(length);
         Ok(())
     }
-
-    #[allow(dead_code)]
-    fn close(self) -> Result<()> {
-        drop(self.file);
-        Ok(())
-    }
 }
 
-
-pub trait FixSizedHeader {
-    fn header_length() -> usize;
-    fn default_serialize() -> Result<Vec<u8>>;
-    fn magic(&self) -> u8;
-    fn get_file_length(&self) -> usize;
-    fn set_file_length(&mut self, len: usize);
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DefaultHeader<const MAGIC: u8>
+impl<Header, Record> DataBaseFile<Header, Record>
+where
+    Header: OrdinaryHeader,
+    Record: OrdinaryRecord
 {
-    magic: u8,
-    file_length: usize,
-}
-
-impl<const MAGIC: u8> FixSizedHeader for DefaultHeader<MAGIC> {
-    fn magic(&self) -> u8 {
-        self.magic
-    }
-
-    fn header_length() -> usize {
-        HEADER_LENGTH as usize
-    }
-
-    fn default_serialize() -> Result<Vec<u8>> {
-        let mut data = serialize(&Self::default())?;
-        assert!(data.len() <= Self::header_length());
-        data.resize(Self::header_length(), 0);
-        Ok(data)
-    }
-
-    fn get_file_length(&self) -> usize {
-        self.file_length
-    }
-
-    fn set_file_length(&mut self, len: usize) {
-        self.file_length = len;
+    #[allow(dead_code)]
+    fn close(mut self) -> Result<()> {
+        self.sync()
     }
 }
-
-impl<const MAGIC: u8> Default for DefaultHeader<MAGIC> {
-    fn default() -> Self {
-        Self {
-            magic: MAGIC,
-            file_length: Self::header_length()
-        }
-    }
-}
-
-impl<const MAGIC: u8> OrdinaryHeader for DefaultHeader<MAGIC> { }
-pub trait OrdinaryHeader: Serialize + DeserializeOwned + Debug + FixSizedHeader + Default + Send + Sync{ }
-pub trait OrdinaryRecord: Serialize + DeserializeOwned + Debug + Send + Sync { }
-
-pub const HEADER_LENGTH: u8 = 24;
-pub const FILE_SIZE_LIMIT: usize = PAGE_SIZE * PAGES_PER_FILE;
-// pub const FILE_SIZE_LIMIT: usize = 1 << 10; // For Test Only
-const PAGE_SIZE: usize = 1 << 12;
-const PAGES_PER_FILE: usize = 1 << 8;
 
 #[cfg(test)]
 mod dbfile_unit_tests {
@@ -407,7 +238,8 @@ mod dbfile_unit_tests {
     use serde::{Serialize, Deserialize};
     use tempfile::tempdir;
 
-    use crate::{Result, engines::kv::dbfile::{MmapFile, Storage}};
+    use crate::{Result, engines::kv::disk::{raw::MmapFile, dbfile::DataBaseFile, Storage, DefaultHeader, files_truct::{Readable, Appendable}}};
     use std::path::PathBuf;
-    use super::{DataBaseFile, DefaultHeader, OrdinaryRecord, Readable, Appendable};
+
+    use super::{OrdinaryRecord};
 }

@@ -1,8 +1,7 @@
 use crate::{Result, KvError};
 
-use super::manifest::*;
-use super::kvfile::{KVFile, KVSSTable};
-use super::dbfile::{Appendable, FILE_SIZE_LIMIT};
+use super::disk::{FILE_SIZE_LIMIT, Appendable, KVSSTable, BlockWriter, KVWritable, Readable, MmapFile};
+use super::{manifest::*, disk::KVFile};
 use super::inner::Statuts;
 
 use std::{sync::{Mutex, Arc}, collections::{HashSet, HashMap}};
@@ -10,18 +9,21 @@ use std::{sync::{Mutex, Arc}, collections::{HashSet, HashMap}};
 pub struct WriteBatch {
     manifest: Arc<Mutex<Manifest>>,
     current_fid: FileId,
-    writers: HashMap<FileId, Box<KVFile>>,
+    writers: HashMap<FileId, Box<KVWritable>>,
     invalid_fids: HashSet<FileId>,
     disk_usage: usize,
 }
 
 impl WriteBatch {
     pub fn new(manifest: Arc<Mutex<Manifest>>) -> Result<Self> {
-        let (current_fid, file) = manifest.lock().unwrap().create_file()?;
+        let (current_fid, file) = manifest.lock().unwrap()
+            .create_file::<BlockWriter>()?;
+
         let mut valid_fids = HashSet::new();
         valid_fids.insert(current_fid);
-        let writer = Box::new(KVFile::init(file)?);
+
         let mut writers = HashMap::new();
+        let writer: Box::<KVWritable> = Box::new(KVFile::init(file)?);
         writers.insert(current_fid, writer);
 
         Ok(Self {
@@ -41,7 +43,7 @@ impl WriteBatch {
 
             Err(err) => {
                 if let Some(KvError::FileSizeExceed) = err.downcast_ref::<KvError>() {
-                    let (current_fid, file) = self.manifest.lock().unwrap().create_file()?;
+                    let (current_fid, file) = self.manifest.lock().unwrap().create_file::<BlockWriter>()?;
                     let current_writer = Box::new(KVFile::init(file)?);
                     self.writers.insert(current_fid, current_writer);
                     self.current_fid = current_fid;
@@ -71,9 +73,13 @@ impl WriteBatch {
         let mut filemap: HashMap<FileId, Box<KVSSTable>> = HashMap::new();
 
         for (fid, mut kvf) in self.writers {
-            // flush all writes to disk.
             kvf.sync()?;
-            filemap.insert(fid, Box::new(*kvf));
+            let kvf = Box::new(
+                KVFile::open(
+                    self.manifest.lock().unwrap()
+                    .open_file::<MmapFile>(fid)?
+            )?);
+            filemap.insert(fid, kvf);
         }
 
         self.manifest.lock().unwrap().atomic_add_remove(
@@ -84,9 +90,6 @@ impl WriteBatch {
         Ok(filemap)
     }
 
-    // TODO: It's useless to remove file to avoid data flush because data flush is guarented
-    // to happen when `Mmap` is droped.
-    // TODO: Maybe use anaonymous Mmap instead?
     #[allow(dead_code)]
     pub fn abort(self) -> Result<()> {
         let mut manifest_guard = self.manifest.lock().unwrap();
@@ -121,7 +124,8 @@ mod writebatch_unit_test {
             rids.push(rid);
         }
         // create a new kvfile and write some value.
-        let (usable_fid, file) = p_manifest.lock().unwrap().create_file()?;
+        let (usable_fid, file) = p_manifest.lock().unwrap()
+            .create_file::<MmapFile>()?;
         let mut kvfile = KVFile::init(file)?;
         let mut rids2 = Vec::new();
         for i in 0..10 {
@@ -152,6 +156,8 @@ mod writebatch_unit_test {
                 true
             );
         }
+        kvfile.sync()?;
+        drop(kvfile);
         // Records writen by usable_fid should not be affected.
         kvfile = KVFile::open(files.remove(0).1)?;
         let records = kvfile.all_records()?;
@@ -206,6 +212,6 @@ mod writebatch_unit_test {
 
     use tempfile;
 
-    use crate::{Result, engines::kv::{manifest::{Manifest, FileId}, kvfile::{KVRecordKind, KVRecord, KVFile}, dbfile::{Appendable, Readable, MmapFile, Storage}, inner::Statuts}};
+    use crate::{Result, engines::kv::{manifest::{Manifest, FileId}, inner::Statuts, disk::{KVRecord, KVRecordKind, KVFile, MmapFile, Storage, Readable, Appendable}}};
     use super::WriteBatch;
 }

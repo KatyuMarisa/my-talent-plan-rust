@@ -629,3 +629,20 @@ engine独立配置线程池接收读/写任务，与多线程直接访问engine�
 上述策略同样不能采用，因为KvStore有Clone Trait，且KvStore是Shallow Copy，这样每次Drop一个KvStore时，无法判断是否有其他线程还在使用KvStoreInner，如果有的话，就必须保留后台线程。
 
 这里我在KvStore中引入了一个DropGuard，这使得DropGuard的引用计数与KvStore的Shallow Copy个数一致。当最后一个KvStore的Shallow Copy被drop时，会触发DropGuard的drop函数，在这个drop函数中杀掉后台线程是安全的，因为此时的KvStore是无法访问的。
+
+
+火焰图分析结果（大概）
+那几个Unknown很让人恼火，不过根据调用栈关系基本能锁定问题出在lockfree::map中，一是大量的内存分配操作，二是大量的内部操作。由于大部分线程会阻塞到memtable的dump上，因此足足有一半左右的cpu时间在空转（即阻塞在sleep上）。
+
+
+
+解决方案：
+1. 尽可能避免compact。这里的compact是全量compact，可以根据tomb-record与kv-record的占比设定阈值
+2. 多路缓冲 + 延迟删除，保证在compact期间，仍然能对外提供服务。延迟删除保证compaction过程中的读请求不阻塞，多路缓冲保证compaction过程中的写请求不阻塞。
+3. 探究为什么lockfree::map会消耗这么多的cpu时间
+
+TODO: 每次重启恢复必定全表扫描，SSTable都已经被映射进来了，mmap的机制不顶用了。
+可以拆解为pin_read和pin_write，仅在compaction时阻塞写请求。
+
+core-dump 大的有点过分，我这边已经649MB了，虽然可能和实现有很大关系
+

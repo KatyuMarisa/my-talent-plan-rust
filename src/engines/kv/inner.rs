@@ -1,12 +1,13 @@
-use crate::engines::kv::kvfile;
+use crate::engines::kv::disk::{FixSizedHeader, Readable};
 use crate::{KvError, Result};
-use super::dbfile::{FixSizedHeader, Readable};
-use super::kvfile::{KVFile, KVRecordKind, KVRecord, KVSSTable};
+use super::disk::{
+    FILE_SIZE_LIMIT, MAGIC_KV,
+    KVFile, KVSSTable, 
+    DefaultHeader, KVRecordKind, KVRecord
+};
 use super::writebatch::WriteBatch;
 use super::memtable::*;
 use super::manifest::*;
-use super::dbfile::{DefaultHeader, FILE_SIZE_LIMIT};
-
 
 use lockfree::map::Map as ThreadSafeMap;
 use lockfree::map::ReadGuard;
@@ -43,7 +44,7 @@ impl KvStoreInner {
             )?;
 
             match h.magic() {
-                kvfile::MAGIC_KV => {
+                MAGIC_KV => {
                     let reader: Box<KVSSTable> = Box::new(
                         KVFile::open(file)?
                     );
@@ -176,17 +177,23 @@ impl KvStoreInner {
         let mut flush_race_retry = 0;
         let v: V;
         loop {
-            if max_retry == 0 {
-                println!("warning: retried too many times.");
-                println!("data_race_retry: {}", data_race_retry);
-                println!("compaction_race_retry: {}", compaction_race_retry);
-                println!("flush_race_retry: {}", flush_race_retry);
+            //if max_retry == 0 {
+            //    println!("warning: retried too many times.");
+            //    println!("data_race_retry: {}", data_race_retry);
+            //    println!("compaction_race_retry: {}", compaction_race_retry);
+            //    println!("flush_race_retry: {}", flush_race_retry);
                 // return Err(KvError::DataRace.into());
-            }
+            //}
 
             match func() {
                 (MemtableState::Ok, vv) => {
                     v = vv;
+                    if max_retry < 0 {
+                        // println!("warning: retried too many times.");
+                        // println!("compaction_race_retry: {}", compaction_race_retry);
+                        // println!("flush_race_retry: {}", flush_race_retry);
+                        // println!("data_race_retry: {}", data_race_retry);
+                    }
                     break;
                 }
 
@@ -283,7 +290,7 @@ impl KvStoreInner {
         // commit batch and create new fid->sstable mapping.
         let filemap = batch.commit(&mut stat).expect("batch commit error");
         self.sstables.extend(filemap);
-        println!("disk_usage: {}, batch_disk_usage: {}, compaction_limit: {}", disk_usage, batch_disk_usage, compaction_limit);
+        // println!("disk_usage: {}, batch_disk_usage: {}, compaction_limit: {}", disk_usage, batch_disk_usage, compaction_limit);
         if disk_usage <= compaction_limit || force_flush {
             // doesn't trigger compaction, so only flush is ok.
             self.memtable.unpin_flush();
@@ -319,7 +326,7 @@ impl KvStoreInner {
             self.memtable.unpin_compaction();
             self.memtable.unpin_flush();
         }
-        println!("{:?}", stat);
+        // println!("{:?}", stat);
         (disk_usage, compaction_limit)
     }
 

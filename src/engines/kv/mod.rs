@@ -1,8 +1,7 @@
-mod dbfile;
+mod disk;
 mod manifest;
 mod memtable;
 mod kvstore;
-mod kvfile;
 mod writebatch;
 mod async_store;
 mod inner;
