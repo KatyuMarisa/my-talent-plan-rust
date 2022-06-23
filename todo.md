@@ -646,3 +646,92 @@ TODO: 每次重启恢复必定全表扫描，SSTable都已经被映射进来了�
 
 core-dump 大的有点过分，我这边已经649MB了，虽然可能和实现有很大关系
 
+2022-06-21
+如何做到写/Compaction互不阻塞？
+
+为什么要阻塞？
+memtable是一个索引，必须指向最新的值。memtable的后台刷新完成后，需要更新索引值，可能引入ABA问题。最简单的方案应该就是版本号（个人的思路是使用next_fid作为版本号）。同一个key可能被使用同一个版本号设定多次。
+
+pin_flush后，可以安全的更新版本号。由于只有一个正在填充的缓冲，因此不会出现更要命的场景...?
+
+
+2022-06-22
+目标：
+1. 读操作不被flush/compaction阻塞
+2. flush/compaction互不阻塞
+
+必须要满足的条件：get总能拿到最新的数据。
+
+当前设计的问题：
+
+flush和compaction会阻塞所有读/写请求。（1）flush/compaction与读/写是互相阻塞的，flush/compaction完成后，需要更新rid，如果继续允许写操作的话可能存在ABA问题，较为简单的方式就是阻塞写操作；（2）读SSTable时需要先获取rid，必须阻塞compaction保证rid是有效的；（3）flush/compaction一批数据时需要顺序遍历索引，这个时候索引不宜更新，因为我难以把握正确性（实际上在不少语言中，迭代遍历的过程里是禁止插入/删除的）；
+
+（2）可以通过引用计数解决，即获取rid后尝试增加文件的引用计数以避免其被compaction所删除；可以使用Arc + DropGuard
+
+（1）中，可以使用版本号来解决ABA问题，即flush/compaction完成，在回设rid时，可以使用附带谓词条件的原子操作比较版本号；
+
+（3）需要引入双缓冲/多路缓冲，可以用一次自旋时停将旧的uncompacted_keys丢到bufRing中，并创建一个新的uncompacted_keys；`std::mem`可能有所帮助；这里其实就是将要锁定的表从索引表移动到了uncompacted_keys上；compaction其实也可以collect成uncompacted_keys，丢到bufRing中；
+
+~~最简单的实现方式应该是使用Arc，每次读请求是进行一次Arc::clone，但这意味着原子操作的量会大增，我不喜欢这样做；~~
+
+我想要一个pin语义，类似于这样：
+
+    loop {
+        if let Some((fid, pos)) = self.memtable.get(key) {
+            // key exist in sstable, but we don't know whether it is removed or not. If get is success, the
+            // sstable is guaranted valid.
+            if let Some(sstable) = self.sstables.get(fid) {
+                return self.sstables.get(fid).unwrap().read_record(pos)
+            } else {
+                continue;
+            }
+        } else {
+            // key is not exist.
+            return None
+        }
+    }
+
+这样虽然可行，但我个人认为不太安全，因为不知道sstable到底在何时会被删除，会被谁删除。例如说上述代码中，客户的线程可能是KVFile的最后一个句柄，当其drop后会触发munmap系统调用，相当于请求线程承担了内存管理任务。况且Memmap库的drop应该是保底用的，不是这么用的。
+
+我需要一个方法，能够知道自己持有的是最后一个句柄...引用计数可能是个好方法。
+
+    pub struct SSTable {
+        sstable: KVSSTable,
+        pin_count: Arc<atomicInt>,
+
+        impl AsRef<Box<KVFile>> for SSTable {
+            fn as_ref(&self) -> Box<KVSSTable> {
+                &self.sstable
+            }
+        }
+
+        pub fn pin(&self) -> PinGuard {
+            self.pin_count.fetch_add(1);
+        }
+    }
+
+    loop {
+        if let Some((fid, pos)) = self.memtable.get(key) {
+            // key exist in sstable, but we don't know whether it is removed or not. If get is success, the
+            // sstable is guaranted valid.
+            if let Some(sstable) = self.sstables.get(fid) {
+                let _pin_guard = sstable.pin();
+                return self.sstables.get(fid).unwrap().read_record(pos)
+            } else {
+                continue;
+            }
+        } else {
+            // key is not exist.
+            return None
+        }
+    }
+
+
+    bg_flush_compaction_loop {
+
+        // after compaction
+        let removed = self.sstables.remove(fid);
+        if removed.pin_count == 1 {
+            remove file is guaranteed to be safe.
+        }
+    }

@@ -1,28 +1,32 @@
 use std::sync::{Condvar, Arc};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, AtomicU8};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
 
 use lockfree::map::{Map as LockFreeMap, ReadGuard};
-use lockfree::set::Set as LockFreeSet;
+use lockfree::set::{Set as LockFreeSet};
 
+use super::access_control::{AccessController, CtrlGuard};
 use super::manifest::Rid;
 
 pub struct Memtable {
     map: LockFreeMap<String, MemtableValue>,
+    ctrl: AccessController,
+    state: AtomicU8,
     uncompacted_keys: LockFreeSet<String>,
-    pin_count: AtomicUsize,
     uncompacted: AtomicUsize,
     flush_limit: usize,
     bg_cond: Arc<Condvar>,
 }
 
 #[derive(PartialEq)]
-pub enum MemtableState {
+pub enum MemtableAccessState {
     Ok,
-    FlushRace,
-    AccessRace,
-    CompactionRace,
-    KeyNotExist(String),
+    Retry,
+    FlushReject,
+    CompactionReject,
+    #[allow(dead_code)]
+    CloseReject,
+    ErrRemoveNonExist,
 }
 
 #[derive(Clone, Debug)]
@@ -32,13 +36,15 @@ pub enum MemtableValue {
 }
 
 impl Memtable {
-    const PINCOUNT_FLUSH: usize = 1 << 12;
-    const PINCOUNT_COMPACTION: usize = 1 << 13;
+    const _MEMTABLE_OK: u8 = 0;
+    const _MEMTABLE_FLUSHING: u8 = 1;
+    const _MEMTABLE_COMPACTION: u8 = 2;
 
     pub fn new(flush_limit: usize, bd_cond: Arc<Condvar>) -> Self {
         Self {
             map: LockFreeMap::new(),
-            pin_count: AtomicUsize::new(0),
+            ctrl: AccessController::default(),
+            state: AtomicU8::new(Self::_MEMTABLE_OK),
             uncompacted_keys: LockFreeSet::new(),
             uncompacted: AtomicUsize::new(0),
             flush_limit,
@@ -46,97 +52,70 @@ impl Memtable {
         }
     }
 
-    pub fn get(&self, key: String) -> (MemtableState, Option<MemtableValue>) {
-        let state = self.pin_read_write();
-        if state != MemtableState::Ok {
-            return (state, None)
-        }
+    /// Get the value from Memtable. and always return MemtableState::Ok.
+    pub fn try_get(&self, key: &String) -> (MemtableAccessState, Option<MemtableValue>) {
+        let state = self.current_state();
+        if MemtableAccessState::Ok == state {
+            if let Some(_read_guard) = self.ctrl.guard_read() {
+                match self.map.get(key) {
+                    Some(kv) => {
+                        return (MemtableAccessState::Ok, Some(kv.val().clone()))
+                    }
 
-        match self.map.get(&key) {
-            Some(v) => {
-                self.unpin_read_write();
-                (MemtableState::Ok, Some(v.val().clone()))
+                    None => {
+                        return (MemtableAccessState::Ok, None)
+                    }
+                }
             }
-
-            None => {
-                self.unpin_read_write();
-                (MemtableState::Ok, None)
-            }
+            return (MemtableAccessState::Retry , None)
         }
+        return (state, None)
     }
 
-    pub fn set(&self, key: String, value: String) -> MemtableState {
-        let state = self.pin_read_write();
-        if state != MemtableState::Ok {
-            return state
-        }
-
-        let len = value.len();
-        self.map.insert(key.to_owned(), MemtableValue::Value(Some(value)));
-        // It seems that [insert into self.map] and [insert into self.uncompacted_keys] should be done linearizationly.
-        // However, both `set` and `remove` operation is insert a new entry into self.uncompacted_keys, so it must be
-        // thread-safe...maybe or not?
-        self.uncompacted_keys.insert(key).unwrap_or_default();
-        let size_after = self.uncompacted.fetch_add(len, SeqCst);
-        self.unpin_read_write();
-
-        if size_after >= self.flush_limit {
-            self.wake_up_flush();
-        }
-        MemtableState::Ok
+    pub fn try_set(&self, key: &String, value: String) -> MemtableAccessState {
+        self.tryset_or_remove(key, Some(value))
     }
 
-    pub fn remove(&self, key: String) -> MemtableState {
-        let state = self.pin_read_write();
-        if state != MemtableState::Ok {
-            return state
-        }
-        // We could *not* remove directly from self.map because such key may also exist in SSTable.
-        // 
-        // A key is guarented to be removed if a TOMB record is flushed into disk. 
-        // 
-        // Another choosable solution in pseudo code:
-        // 
-        // defer self.unpin_read_write();
-        // if !self.map.has_key(&key) {
-        //     return KeyNotExist
-        // }
-        // 
-        // if self.map.insert(key, Value::TOMB).is_some() {
-        //     return Ok
-        // } else {
-        //     return KeyNotExist
-        // }
-        // 
-        // Such solution will be more effective if most operation try to remove non-exist keys, which is
-        // really rare. On the other hand, such operation will result in error, which is very heavy 
-        // (because of the resolve of symbol table and runtime support). So we don't choose the solution above.
-        // 
-        let len = key.len();
-        let key_found: bool = self.map.insert(key.to_owned(), MemtableValue::Value(None)).is_some();
-        self.uncompacted_keys.insert(key.to_owned()).unwrap_or_default();
-        let size_after = self.uncompacted.fetch_add(len, SeqCst);
-        if size_after > self.flush_limit {
-            self.wake_up_flush();
-        }
+    pub fn try_remove(&self, key: &String) -> MemtableAccessState {
+        self.tryset_or_remove(key, None)
+    }
 
-        if key_found {
-            self.unpin_read_write();
-            MemtableState::Ok
+    /// Set a new key-value mapping. This method may block when index is updating.
+    fn tryset_or_remove(&self, key: &String, value: Option<String>) -> MemtableAccessState {
+        let state = self.current_state();
+        if MemtableAccessState::Ok == state {
+            if let Some(_write_guard) = self.ctrl.guard_write() {
+                // estimate size amount
+                let mut len = key.len();
+                if let Some(ref val) = value {
+                    len += val.len();
+                }
+                // perform insertion/deleteion
+                let is_remove = value.is_none();
+                let key_exist =
+                    self.map.insert(key.to_owned(), MemtableValue::Value(value)).is_some();
+                // wake up background thread if size exceed flush threshold
+                let size_after = self.uncompacted.fetch_add(len, SeqCst);
+                if size_after > self.flush_limit {
+                    self.wake_up();
+                }
+                // remove a non exist key should be treat specially
+                if is_remove && !key_exist {
+                    return MemtableAccessState::ErrRemoveNonExist;
+                } else {
+                    return MemtableAccessState::Ok;
+                }
+            }
+            return MemtableAccessState::Retry;
         } else {
-            self.unpin_read_write();
-            MemtableState::KeyNotExist(key)
+            return state
         }
     }
 
-    // This method can only be called when database is recovering or when database is doing flush/compaction.
-    // Because we have forbiden all read/write requests, so it's safe.
+    /// This method can only be called when database is recovering or when database is doing flush/compaction.
+    /// Because we have forbiden all read/write requests, so it's safe.
     pub fn raw_set(&self, key: &String, val: MemtableValue) {
-        let pin = self.pin_count.load(Relaxed);
-        assert!(pin == 0 ||
-            pin == Self::PINCOUNT_FLUSH ||
-            pin == (Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH));
-
+        assert!(self.ctrl.check_write_paused());
         if let MemtableValue::Value(Some(_)) = &val {
             unreachable!();
         }
@@ -144,221 +123,86 @@ impl Memtable {
         self.map.insert(key.to_owned(), val);
     }
 
-    // This metchod can only be called when database is recovering, which is safe.
+    /// This metchod can only be called when database is recovering, which is safe.
     pub fn raw_remove(&self, key: &String) {
-        assert!(self.pin_count.load(Relaxed) == 0);
+        assert!(self.ctrl.check_write_paused());
         self.map.remove(key);
     }
 
-    // Lazily remove all keys in self.uncompacted_keys and return an iterator of all flushable kv-pairs.
-    pub fn take_all_flushable(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
-        assert!(self.pin_count.load(Relaxed) == Self::PINCOUNT_FLUSH);
-        self.uncompacted.store(0, SeqCst);
-        self.uncompacted_keys.iter().map(move |guard| {
-            self.uncompacted_keys.remove(guard.as_ref());
-            self.map.get(guard.as_ref()).unwrap()
-        })
+    /// Whether flush or not.
+    pub fn should_flush(&self) -> bool {
+        self.uncompacted.load(Relaxed) >= self.flush_limit
     }
 
-    // Return an iterator across all values in Memtable.
-    pub fn take_all(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
-        assert!(self.pin_count.load(Relaxed) == Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH);
-        // assert!(self.uncompacted_keys.iter().count() == 0);  time consuming
+    /// Prepare for flush, reject all incoming write requests. The CtrlGuard returned from this function should
+    /// be consumed when flush task is finish, just call `Memtable::finish_flush` and pass it as argument.
+    pub fn prepare_flush(&self) -> CtrlGuard {
+        self.state.compare_exchange(Self::_MEMTABLE_OK, Self::_MEMTABLE_FLUSHING, Acquire, Relaxed).unwrap();
+        self.ctrl.pause_write()
+    }
+
+    /// Prepare for compaction. This function is just as same as `prepare_flush` expect that the incoming write requests may
+    /// sleep for longer time. 
+    pub fn prepare_compaction(&self) {
+        self.state.compare_exchange(Self::_MEMTABLE_OK, Self::_MEMTABLE_COMPACTION, Acquire, Relaxed).unwrap();
+    }
+
+    /// Flush/compaction task is finished, Memtable could handle write requests or safe close. Use `CtrlGuard` returned from
+    /// Memtable::prepare_flush_or_compaction as argument.
+    pub fn finish_flush(&self, g: CtrlGuard) {
+        assert!(self.ctrl.check_write_paused());
+        drop(g);
+    }
+
+    /// Prepare for force flush even Memtable doesn't reach flush threshold.
+    /// This method is valid iff no read/write is performing and no incomming read/write requests.
+    pub fn prepare_force_flush(&self) {
+        assert!(self.state.load(Relaxed) == Self::_MEMTABLE_OK && self.ctrl.check_no_pending_requests());
+        self.uncompacted.store(self.flush_limit + 1, Relaxed);
+    }
+
+    /// Remove all keys in self.uncompacted_keys and return an iterator of all flushable kv-pairs.
+    /// TODO: I'm afraid of writing unsafe code. Is there any elegant way to clean/take all values
+    /// in self.uncompacted_keys?
+    pub fn take_all_flushable(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
+        assert!(self.ctrl.check_write_paused());
+        let mut res = Vec::new();
+        for key in self.uncompacted_keys.iter() {
+            self.uncompacted_keys.remove(key.as_ref());
+            res.push(self.map.get(key.as_ref()).unwrap());
+        }
+        self.uncompacted.store(0, Relaxed);
+        res.into_iter()
+    }
+
+    /// Return an iterator across all key index.
+    pub fn all(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
+        assert!(self.ctrl.check_write_paused());
         self.map.iter()
     }
 
-    pub fn should_flush(&self) -> bool {
-        self.uncompacted.load(Acquire) >= self.flush_limit
-    }
-
-    pub fn pin_flush(&self) -> bool {
-        loop {
-            let pin = self.pin_count.load(Acquire);
-            if pin >= Self::PINCOUNT_FLUSH {
-                return false;
+    fn current_state(&self) -> MemtableAccessState {
+        match self.state.load(Relaxed) {
+            Self::_MEMTABLE_OK => {
+                MemtableAccessState::Ok
             }
- 
-            if self.pin_count.compare_exchange(pin, pin + Self::PINCOUNT_FLUSH,
-                Acquire, Relaxed).is_ok() {
-                // We have block all succeed read/write requests. Now we are waiting for remaining requests to finish.
-                loop {
-                    assert!(self.pin_count.load(Relaxed) >= Self::PINCOUNT_FLUSH);
-                    if Self::PINCOUNT_FLUSH == self.pin_count.load(Acquire) {
-                        return true;
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
+
+            Self::_MEMTABLE_FLUSHING => {
+                MemtableAccessState::FlushReject
+            }
+
+            Self::_MEMTABLE_COMPACTION => {
+                MemtableAccessState::CompactionReject
+            }
+
+            _ => {
+                unreachable!("???");
             }
         }
     }
 
-    pub fn unpin_flush(&self) {
-        self.pin_count.compare_exchange(Self::PINCOUNT_FLUSH,
-            0, Acquire, Relaxed).unwrap();
-    }
-
-    pub fn pin_compaction(&self) {
-        self.pin_count.compare_exchange(Self::PINCOUNT_FLUSH,
-            Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH, Acquire, Relaxed).unwrap();
-    }
-
-    pub fn unpin_compaction(&self) {
-        self.pin_count.compare_exchange(Self::PINCOUNT_COMPACTION + Self::PINCOUNT_FLUSH,
-            Self::PINCOUNT_FLUSH, Acquire, Relaxed).unwrap();
-    }
-
-    // only valid if no read/write is performing
-    pub fn stop_and_prepare_flush_memtable(&self) {
-        self.pin_count.compare_exchange(0, Self::PINCOUNT_FLUSH,  Acquire, Relaxed).unwrap();
-        self.uncompacted.store(self.flush_limit + 1, SeqCst);
-    }
-
-    /// If MemtableState::Ok is returned, all read/write access before unpn_read_write
-    /// is guaranted to be safe.
-    /// Should `unpin_read_write` after a read/write access is complete.
-    fn pin_read_write(&self) -> MemtableState {
-        let mut retry = 5;
-        loop {
-            if 0 == retry {
-                return MemtableState::AccessRace;
-            }
-            let pin = self.pin_count.load(Acquire);
-            if (Self::PINCOUNT_FLUSH..Self::PINCOUNT_COMPACTION).contains(&pin) {
-                return MemtableState::FlushRace;
-            } else if pin >= Self::PINCOUNT_COMPACTION {
-                return MemtableState::CompactionRace;
-            }
-
-            if self.pin_count.compare_exchange(pin, pin + 1, Acquire, Relaxed).is_ok() {
-                return MemtableState::Ok;
-            } else {
-                // nothing to do.
-            }
-            retry -= 1;
-        }
-    }
-
-    /// unpin read/write access.
-    fn unpin_read_write(&self) {
-        self.pin_count.fetch_sub(1, Acquire);
-    }
-
-    /// Return false if compaction already completed, or another thread is doing compaction.
-    /// If true is returned, this thread must take charge of compaction task.
-    fn wake_up_flush(&self) {
+    /// Wake up background thread to check Memtable. It always indicate a flush task should be scheduled.
+    fn wake_up(&self) {
         self.bg_cond.notify_one();
-    }
-}
-
-#[cfg(test)]
-mod memtable_unit_test {
-    use std::sync::Arc;
-    use std::sync::Condvar;
-    use std::sync::Mutex;
-
-    use rand::random;
-
-    use crate::Result;
-    use super::Memtable;
-    use super::MemtableState;
-    use super::MemtableValue;
-
-    #[test]
-    fn test_multi_thread() -> Result<()> {
-        let cond = Arc::new(Condvar::new());
-        let memtb = Arc::new(Memtable::new(1 << 14, cond.clone()));
-        
-        let cond2 = cond.clone();
-        let memtb2 = memtb.clone();
-        let running = Arc::<Mutex<bool>>::new(Mutex::new(true));
-        let running2 = running.clone();
-        let bg_flush_compaction = std::thread::spawn(move || {
-            loop {
-                {
-                    let guard = running2.lock().unwrap();
-                    if !(*guard) {
-                        break;
-                    }
-                    _ = cond2.wait(guard);
-                }
-
-                if !memtb2.should_flush() {
-                    continue;
-                }
-
-                if !memtb2.pin_flush() {
-                    panic!("should not happend");
-                }
-
-                // mock flush or compaction
-                let x: u8 = random();
-                if 0 == x % 2 {
-                    // flush
-                    memtb2.pin_flush();
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    memtb2.unpin_flush();
-                } else {
-                    // compaction
-                    memtb2.pin_flush();
-                    memtb2.pin_compaction();
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                    memtb2.unpin_compaction();
-                    memtb2.unpin_flush();
-                }
-            }
-            println!("safe exit");
-        });
-
-        let thread_nums = 100;
-        let mut threads = Vec::new();
-        for i in 0..thread_nums {
-            let memtb_handle = memtb.clone();
-            let thread_handle = std::thread::spawn(move || {
-                for j in 0..2000 {
-                    let key = format!("key-{}-{}", i, j);
-                    let value = format!("value-{}-{}", i, j);
-
-                    loop {
-                        match memtb_handle.set(key.to_owned(), value.to_owned()) {
-                            MemtableState::Ok => { break; },
-                            MemtableState::AccessRace => { println!("Access Race!"); },
-                            MemtableState::FlushRace => { std::thread::sleep(std::time::Duration::from_millis(10)); },
-                            MemtableState::CompactionRace => { std::thread::sleep(std::time::Duration::from_millis(50)); },
-                            MemtableState::KeyNotExist(_) => { panic!("should not happend"); },
-                        }
-                    }
-                }
-            });
-            threads.push(thread_handle);
-        }
-        
-        for h in threads {
-            h.join().unwrap();
-        }
-
-        // kill the background thread.
-        {
-            let mut guard = running.lock().unwrap();
-            *guard = false;
-            cond.notify_one();
-        }
-
-        bg_flush_compaction.join().unwrap();
-
-        for i in 0..thread_nums {
-            for j in 0..2000 {
-                let key = format!("key-{}-{}", i, j);
-                let value = format!("value-{}-{}", i, j);
-                let (_, value2) = memtb.get(key);
-                if let Some(MemtableValue::Value(Some(value3))) = value2 {
-                    assert!(value3 == value);
-                } else {
-                    assert!(false);
-                }
-            }
-        }
-
-        Ok(())
     }
 }

@@ -16,6 +16,8 @@ pub enum KvError {
     MaybeCorrput,
     #[fail(display = "Race.")]
     DataRace,
+    #[fail(display = ".")]
+    Info(String)
 }
 
 impl From<io::Error> for KvError {

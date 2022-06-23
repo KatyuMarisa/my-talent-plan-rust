@@ -101,64 +101,75 @@ impl KvStoreInner {
 }
 
 impl KvStoreInner {
-    pub fn get_from_memtable(&self, key: &String) -> Result<Option<MemtableValue>> {
-        let func = || {
-            self.memtable.get(key.to_owned())
-        };
-        let cb = |v: Option<MemtableValue>| {
-            Ok(v)
-        };
-        self.memtable_retry_loop(func, cb)
-    }
-
-    pub fn get_from_sstable(&self, rid: &Rid) -> Result<Option<String>> {
-        let (fid, pos) = rid;
-        let record = self.sstables
-            .get(fid)
-            .unwrap()
-            .val()
-            .read_record_at(pos.0, pos.1)?;
-        
-        if record.kind == KVRecordKind::Tomb {
-            Ok(None)
-        } else {
-            Ok(Some(record.value))
-        }
-    }
-
     pub fn set(&self, key: String, value: String) -> Result<()> {
         let func = || {
-            (self.memtable.set((&key).to_owned(), (&value).to_owned()), ())
+            (self.memtable.try_set(&key, (&value).to_owned()), ())
         };
-    
-        let cb = |()| { Ok(()) };
+        let cb = |()| {
+            Ok(())
+        };
 
         self.memtable_retry_loop(func, cb)
     }
 
     pub fn get(&self, key: String) -> Result<Option<String>> {
-        let value_or_pos = self.get_from_memtable(&key)?;
-        match value_or_pos {
-            Some(MemtableValue::Rid(rid)) => {
-                self.get_from_sstable(&rid)
+        let func = || {
+            self.memtable.try_get(&key)
+        };
+        let cb = |v| -> Result<(bool, Option<String>)> {
+            match v {
+                Some(MemtableValue::Rid(rid)) => {
+                    // Even though we have get rid, the corresponding file may be removed by compaction. If so, 
+                    // we just retry for another time.
+                    self.try_get_from_sstable(rid)
+                }
+
+                Some(MemtableValue::Value(val)) => {
+                    Ok((true, val))
+                }
+
+                None => {
+                    Ok((true, None))
+                }
             }
-            Some(MemtableValue::Value(valstr)) => {
-                Ok(valstr)
-            }
-            None => {
-                Ok(None)
+        };
+
+        loop {
+            match self.memtable_retry_loop(func, cb) {
+                Ok((success, res)) => {
+                    if success {
+                        return Ok(res)
+                    }
+                },
+                Err(err) => {
+                    return Err(err)
+                },
             }
         }
     }
 
     pub fn remove(&self, key: String) -> Result<()> {
         let func = || {
-            (self.memtable.remove((&key).to_owned()), ())
+            (self.memtable.try_remove(&key), ())
+        };
+        let cb = |()| {
+            Ok(())
         };
 
-        let cb = |()| { Ok(()) };
-
         self.memtable_retry_loop(func, cb)
+    }
+
+    pub fn try_get_from_sstable(&self, rid: Rid) -> Result<(bool, Option<String>)> {
+        let (fid, rid) = rid;
+        if let Some(sstable) = self.sstables.get(&fid) {
+            let record = sstable.val().read_record_at(rid.0, rid.1)?;
+            if record.kind == KVRecordKind::Tomb {
+                return Ok((true, None))
+            } else {
+                return Ok((true, Some(record.value.to_owned())))
+            }
+        }
+        Ok((false, None))
     }
 
     /// A complex method to avoid duplicate code.
@@ -168,65 +179,43 @@ impl KvStoreInner {
     /// R: return type for callback
     fn memtable_retry_loop<F, V, C, R>(&self, func: F, cb: C) -> Result<R>
     where
-        F: Fn() -> (MemtableState, V),
-        C: Fn(V) -> Result<R>,
+        F: Fn() -> (MemtableAccessState, V),
+        C: FnOnce(V) -> Result<R>
     {
-        let mut max_retry = 100;
-        let mut data_race_retry = 0;
-        let mut compaction_race_retry = 0;
-        let mut flush_race_retry = 0;
         let v: V;
         loop {
-            //if max_retry == 0 {
-            //    println!("warning: retried too many times.");
-            //    println!("data_race_retry: {}", data_race_retry);
-            //    println!("compaction_race_retry: {}", compaction_race_retry);
-            //    println!("flush_race_retry: {}", flush_race_retry);
-                // return Err(KvError::DataRace.into());
-            //}
-
-            match func() {
-                (MemtableState::Ok, vv) => {
+            let (state, vv) = func();
+            match state {
+                MemtableAccessState::Ok => {
                     v = vv;
-                    if max_retry < 0 {
-                        // println!("warning: retried too many times.");
-                        // println!("compaction_race_retry: {}", compaction_race_retry);
-                        // println!("flush_race_retry: {}", flush_race_retry);
-                        // println!("data_race_retry: {}", data_race_retry);
-                    }
                     break;
-                }
+                },
 
-                (MemtableState::AccessRace, _) => {
-                    data_race_retry += 1;
-                    // data race is too heavy, but no flush or compaction is happending, so juse
-                    // retry for another time.
-                }
+                MemtableAccessState::Retry => {
+                    continue;
+                },
 
-                (MemtableState::FlushRace, _) => {
-                    // wakeup may lost, so we set a timeout
-                    // _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_millis(100));
+                MemtableAccessState::FlushReject => {
                     std::thread::sleep(std::time::Duration::from_millis(3));
-                    flush_race_retry += 1;
-                }
+                    continue;
+                },
 
-                (MemtableState::CompactionRace, _) => {
-                    // wakeup may lost, so we set a timeout
-                    // _ = self.bg_pending_cond.wait_timeout(self.bg_pending_mutex.lock().unwrap(), std::time::Duration::from_secs(100));
+                MemtableAccessState::CompactionReject => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
-                    compaction_race_retry += 1;
-                }
+                    continue;
+                },
 
-                (MemtableState::KeyNotExist(key), _) => {
-                    return Err(KvError::KeyNotFoundError { key }.into())
-                }
+                MemtableAccessState::CloseReject => {
+                    return Err(KvError::Info(String::from("Memtable is closed")).into())
+                },
+
+                MemtableAccessState::ErrRemoveNonExist => {
+                    unreachable!("unreachable branch")
+                },
             }
-
-            max_retry -= 1;
         }
         cb(v)
     }
-
 }
 
 #[derive(Default, std::fmt::Debug)]
@@ -252,9 +241,7 @@ impl KvStoreInner {
         assert!(*state_guard != State::Exit);
         // handle compaction/flush
         while *state_guard != State::Closed {
-            if self.memtable.should_flush() && self.memtable.pin_flush() {
-                (disk_usage, compaction_limit) = self.maybe_flush_or_compact(disk_usage, compaction_limit);
-            }
+            (disk_usage, compaction_limit) = self.maybe_flush_or_compact(disk_usage, compaction_limit);
             state_guard = self.bg_flush_cond.wait(state_guard).unwrap();
         }
         drop(state_guard);
@@ -265,7 +252,7 @@ impl KvStoreInner {
 
     pub fn force_flush(&self) {
         assert!(*self.state.lock().unwrap() == State::Closed);
-        self.memtable.stop_and_prepare_flush_memtable();
+        self.memtable.prepare_force_flush();
         self.maybe_flush_or_compact(0, 1);
         {
             let mut state_guard = self.state.lock().unwrap();
@@ -275,6 +262,11 @@ impl KvStoreInner {
     }
 
     fn maybe_flush_or_compact(&self, mut disk_usage: usize, mut compaction_limit: usize) -> (usize, usize) {
+        if !self.memtable.should_flush() {
+            return (disk_usage, compaction_limit);
+        }
+        // Guard for flush/compaction.
+        let flush_compaction_guard = self.memtable.prepare_flush();
         let mut stat: Statuts = Statuts::default();
         let force_flush = compaction_limit == 1;
         stat.kind = "Flush".to_string();
@@ -292,18 +284,17 @@ impl KvStoreInner {
         self.sstables.extend(filemap);
         // println!("disk_usage: {}, batch_disk_usage: {}, compaction_limit: {}", disk_usage, batch_disk_usage, compaction_limit);
         if disk_usage <= compaction_limit || force_flush {
-            // doesn't trigger compaction, so only flush is ok.
-            self.memtable.unpin_flush();
+            // Nothing to do because disk_usage not reach compaction threshold.
         } else {
             // trigger compaction...
             // TODO: Multi Flush Buffer + Delay Delete to ensure read/write non-block.
             stat.kind = "Compaction".to_string();
-            self.memtable.pin_compaction();
+            self.memtable.prepare_compaction();
             let before_fids = self.manifest.lock().unwrap().all_fids();
             batch = WriteBatch::new(self.manifest.clone()).expect("create WriteBatch error");
             self.flush_and_reset_rids(
                 &mut batch,
-                self.memtable.take_all(),
+                self.memtable.all(),
                 &mut stat)
                 .expect("write to WriteBatch error");
             // after compaction, all previous fids is invalid.
@@ -323,9 +314,8 @@ impl KvStoreInner {
                 // most of records is duplicate, so we shrink compaction_limit.
                 compaction_limit = prev_disk_usage * 2 / 3;
             }
-            self.memtable.unpin_compaction();
-            self.memtable.unpin_flush();
         }
+        self.memtable.finish_flush(flush_compaction_guard);
         // println!("{:?}", stat);
         (disk_usage, compaction_limit)
     }
