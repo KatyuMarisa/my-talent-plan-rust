@@ -1,10 +1,15 @@
-use std::{sync::{Arc, Mutex, Barrier, Condvar}, collections::LinkedList, iter::Zip};
+use std::{
+    sync::{Arc, Mutex, Barrier, Condvar, 
+        atomic::{Ordering::Relaxed, AtomicBool}
+    }, 
+    collections::LinkedList, iter::Zip
+};
 
 use lockfree::map::ReadGuard;
 
 use crate::Result;
 use super::{
-    bufring::{BufRing, create_buf_ring, BufNodePtr},
+    bufring::{BufRing, BufNodePtr},
     inner::KvStoreInner,
     memtable::{ShouldFlushOrCompact, MemtableValue},
     manifest::Rid,
@@ -13,8 +18,8 @@ use super::{
 };
 
 enum FlushCompactionTask {
-    Flush(BufNodePtr),
-    Compaction,
+    Flush((BufNodePtr, usize)),
+    Compaction(usize),
 }
 
 pub struct Compactor {
@@ -22,10 +27,9 @@ pub struct Compactor {
     // buffer ring
     ring: Arc<Mutex<BufRing>>,
     // pending flush/compaction task
-    // statistic: Arc<Mutex<CompactionStatistic>>,
-
     pending_task: Arc<Mutex<LinkedList<FlushCompactionTask>>>,
-    running: Mutex<bool>,
+    // running mark
+    running: AtomicBool,
     // shared between `Memtable` and `Compactor`
     monitor_cond: Arc<Condvar>,
     // shared between monitor thread and compaction thread
@@ -37,15 +41,13 @@ pub struct Compactor {
 impl Compactor {
     pub const INIT_COMPACT_LIMIT: usize = 10 * FILE_SIZE_LIMIT;
 
-    pub fn new(inner: Arc<KvStoreInner>,
-        cond: Arc<Condvar>,
-    ) -> Self {
+    pub fn new(inner: Arc<KvStoreInner>, cond: Arc<Condvar>, ring: Arc<Mutex<BufRing>>) -> Self {
         Self {
             inner,
             monitor_cond: cond,
             flush_cond: Arc::new(Condvar::new()),
-            running: Mutex::new(true),
-            ring: Arc::new(create_buf_ring()),
+            running: AtomicBool::new(true),
+            ring,
             pending_task: Arc::new(Mutex::new(LinkedList::new())),
             shutdown: Arc::new(Barrier::new(3)),
         }
@@ -55,57 +57,66 @@ impl Compactor {
     /// A waiting compaction task will discard all waiting flush task, because compaction task will do anything that
     /// flush should do.
     fn schedule_compaction(&self) {
-        let old = self.plugin_buf(true);
+        let (old, vid) = self.update_buf(None, true);
         let mut ring = self.ring.lock().unwrap();
         ring.release_buf(old);
 
         let mut pending_flush_tasks = self.pending_task.lock().unwrap();
         for task in pending_flush_tasks.iter() {
             match task {
-                FlushCompactionTask::Flush(old) => {
+                FlushCompactionTask::Flush((old, _)) => {
                     ring.release_buf(*old);
                 },
-                FlushCompactionTask::Compaction => {},
+                FlushCompactionTask::Compaction(_) => {},
             }
         }
         pending_flush_tasks.clear();
-        pending_flush_tasks.push_back(FlushCompactionTask::Compaction);
-        self.monitor_cond.notify_all();
+        pending_flush_tasks.push_back(FlushCompactionTask::Compaction(vid));
+        self.flush_cond.notify_all();
     }
 
     /// Schedule a background flush task.
     fn schedule_flush(&self) {
-        let old = self.plugin_buf(false);
+        let old = self.update_buf(None, false);
         self.pending_task
             .lock().unwrap()
             .push_back(FlushCompactionTask::Flush(old));
+        self.flush_cond.notify_all();
     }
 
     /// Allocate a new buf from ring, and swap out the old buf in memtable.
-    fn plugin_buf(&self, is_compaction: bool) -> BufNodePtr {
-        let new_buf_ptr = loop {
-            let buf = self.ring.lock().unwrap().alloc_buf();
-            match buf {
-                Some(buf_ptr) => break buf_ptr,
-                None => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+    fn update_buf(&self, default: Option<BufNodePtr>, is_compaction: bool) -> (BufNodePtr, usize) {
+        println!("update buf!");
+        let new_buf_ptr = if let Some(buf_ptr) = default {
+            buf_ptr
+        } else {
+            loop {
+                let buf = self.ring.lock().unwrap().alloc_buf();
+                match buf {
+                    Some(buf_ptr) => break buf_ptr,
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                 }
             }
         };
 
         let pause_write = self.inner.memtable.pause_for_swap_buf();
         let old = self.inner.memtable.swap_buf(new_buf_ptr, is_compaction);
+        let vid = self.inner.memtable.advance_version();
         self.inner.memtable.finish(pause_write);
-        old
+        (old, vid)
     }
 }
 
 impl Compactor {
     pub fn monitor_loop(&self) {
+        let unused = Mutex::new(false);
+
         loop {
             {
-                let running = self.running.lock().unwrap();
-                if *running == false {
+                let running = self.running.load(Relaxed);
+                if !running {
                     break;
                 }
             }
@@ -122,10 +133,10 @@ impl Compactor {
                 }
             }
 
-            {
-                let running = self.running.lock().unwrap();
-                let _ = self.monitor_cond.wait(running).unwrap();
-            }
+            let _ = self.monitor_cond.wait_timeout(
+                unused.lock().unwrap(),
+                std::time::Duration::from_millis(50))
+            .unwrap();
         }
 
         // exit whit drop thread
@@ -135,45 +146,62 @@ impl Compactor {
     pub fn flush_compaction_loop(&self) {
         loop {
             {
-                let running = self.running.lock().unwrap();
-                if *running == false {
+                let running = self.running.load(Relaxed);
+                if !running {
                     break;
                 }
             }
 
-            let task = {
-                let mut pending_task = self.pending_task.lock().unwrap();
-                pending_task.pop_front()
-            };
+            loop {
+                let task = self.pending_task.lock().unwrap().pop_front();
+                match task {
+                    None => { break; },
 
-            match task {
-                None => continue,
+                    Some(FlushCompactionTask::Flush((old, vid))) => {
+                        self.do_flush(old, vid).expect("flush failed");
+                    }
 
-                Some(FlushCompactionTask::Flush(old)) => {
-                    self.do_flush(old).expect("flush failed");
-                }
-
-                Some(FlushCompactionTask::Compaction) => {
-                    self.do_compaction().expect("compaction failed");
+                    Some(FlushCompactionTask::Compaction(vid)) => {
+                        self.do_compaction(vid).expect("compaction failed");
+                    }
                 }
             }
 
             {
                 let pending_task = self.pending_task.lock().unwrap();
-                let _ = self.flush_cond.wait(pending_task).unwrap();
+                let _ = self.flush_cond.wait_timeout(
+                    pending_task,
+                    std::time::Duration::from_millis(50),
+                ).unwrap();
             }
         }
+
+        // drain
+        while let Some(task) = self.pending_task.lock().unwrap().pop_back() {
+            match task {
+                FlushCompactionTask::Flush((old, vid)) => {
+                    self.do_flush(old, vid).expect("flush failed");
+                }
+
+                _ => {
+                    continue;
+                }
+            }
+        }
+
         // exit with drop thread
         self.shutdown.wait();
     }
 
     fn stop(&self) {
-        *self.running.lock().unwrap() = false;
+        self.running.store(false, Relaxed);
+        self.monitor_cond.notify_all();
+        self.flush_cond.notify_all();
     }
 }
 
 impl Compactor {
-    fn do_flush(&self, old: BufNodePtr) -> Result<()> {
+    fn do_flush(&self, old: BufNodePtr, vid: usize) -> Result<()> {
         let mut statistic = Statistic::new("flush");
         let start = std::time::Instant::now();
         let uncompacted_keys = old.as_ref().as_inner();
@@ -181,19 +209,20 @@ impl Compactor {
             self.inner.memtable.raw_get(e.as_ref())
         }).collect::<Vec<_>>();
         let rids = self.sink(&mut uncompacted_keys, false, &mut statistic)?;
-        self.update_inner_fids(uncompacted_keys.into_iter().zip(rids.into_iter()), false, &mut statistic);
+        self.update_inner_fids(uncompacted_keys.into_iter().zip(rids.into_iter()), vid, false, &mut statistic);
         statistic.timecost_total = start.elapsed().as_millis();
+        self.ring.lock().unwrap().release_buf(old);
         println!("{:?}", statistic);
         Ok(())
     }
 
-    fn do_compaction(&self) -> Result<()> {
+    fn do_compaction(&self, vid: usize) -> Result<()> {
         let mut statistic = Statistic::new("compaction");
         let start = std::time::Instant::now();
         let iter = self.inner.memtable.iter();
         let mut uncompacted_keys = iter.collect::<Vec<_>>();        
         let rids = self.sink(&mut uncompacted_keys, true, &mut statistic)?;
-        self.update_inner_fids(uncompacted_keys.into_iter().zip(rids.into_iter()), true, &mut statistic);
+        self.update_inner_fids(uncompacted_keys.into_iter().zip(rids.into_iter()), vid, true, &mut statistic);
         statistic.timecost_total = start.elapsed().as_millis();
         println!("{:?}", statistic);
         Ok(())
@@ -207,6 +236,7 @@ impl Compactor {
     -> Result<Vec<Option<Rid>>> {
         // sort by file_id and position in memory to make code more cache friendly.
         let start = std::time::Instant::now();
+        println!("sink {} records", records.len());
 
         records.sort_by(|a, b| {
             match (a.val(), b.val()) {
@@ -308,6 +338,7 @@ impl Compactor {
     fn update_inner_fids<'a> (
         &'a self,
         iter: Zip <impl Iterator<Item = ReadGuard<'a, String, MemtableValue>>, impl Iterator<Item = Option<Rid>>>,
+        vid: usize,
         is_compaction: bool,
         statistic: &mut Statistic)
     {
@@ -315,29 +346,39 @@ impl Compactor {
         let start = std::time::Instant::now();
         let guard = {
             if is_compaction {
-                self.inner.memtable.pause_for_reset_flush_rids()
-            } else {
                 self.inner.memtable.pause_for_reset_compaction_rids()
+            } else {
+                self.inner.memtable.pause_for_reset_flush_rids()
             }
         };
 
-        let vid = self.inner.memtable.advance_version();
-
         for (key_value, rid) in iter.into_iter() {
+            // never worry about vid conflict because we have paused all write requests.
             match key_value.val() {
                 MemtableValue::Rid((vid2, _)) => {
-                    debug_assert!(*vid2 >= vid);
-                    // never worry about vid conflict because we have paused all write requests.
-                    if *vid2 == vid {
-                        match rid {
-                            None => self.inner.memtable.raw_set(key_value.key(), MemtableValue::Value((vid, None))),
-                            Some(rid) => self.inner.memtable.raw_set(key_value.key(), MemtableValue::Rid((vid, rid))),
+                    debug_assert!(vid > *vid2);
+                    match rid {
+                        None => {
+                            self.inner.memtable.raw_set(key_value.key(), MemtableValue::Value((vid, None)));
+                        }
+                        Some(rid) => {
+                            self.inner.memtable.raw_set(key_value.key(), MemtableValue::Rid((vid, rid)));
                         }
                     }
                 }
 
                 MemtableValue::Value((vid2, _)) => {
-                    debug_assert!(*vid2 > vid);
+                    debug_assert!(vid >= *vid2);
+                    if *vid2 == vid {
+                        match rid {
+                            None => {
+                                self.inner.memtable.raw_set(key_value.key(), MemtableValue::Value((vid, None)));
+                            }
+                            Some(rid) => {
+                                self.inner.memtable.raw_set(key_value.key(), MemtableValue::Rid((vid, rid)));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -353,17 +394,17 @@ impl Compactor {
     }
 }
 
-impl Drop for Compactor {
-    fn drop(&mut self) {
-        // TODO: drain pending tasks.
+impl Compactor {
+    pub fn suicide(&self) {
         self.stop();
-        self.shutdown.wait();
-        // wait for two background thread exit.
+        // make sure all threads that holds Arc<Compactor> hard ref join.
         std::thread::sleep(std::time::Duration::from_millis(1));
-        // force flush memtable to sstable.
+        self.shutdown.wait();
+        // release last buf.
         self.inner.memtable.prepare_force_flush();
-        let old = self.plugin_buf(false);
-        self.do_flush(old).expect("force flush error");
+        let nullptr = BufNodePtr::from(std::ptr::null_mut());
+        let (last_ptr, vid) = self.update_buf(Some(nullptr), false);
+        self.do_flush(last_ptr, vid).expect("force flush error");
     }
 }
 

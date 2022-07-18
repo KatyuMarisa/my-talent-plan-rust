@@ -10,37 +10,40 @@ use std::path::PathBuf;
 pub struct KvStore {
     inner: Arc<KvStoreInner>,
     _compactor: Arc<Compactor>,
+    _suicide: Arc<CompactorSuicide>,
 }
 
 impl KvStore {
     pub fn open(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let bg_cond = Arc::new(Condvar::new());
         let ring = Arc::new(create_buf_ring());
-        let inner = KvStoreInner::open(root_dir, bg_cond.clone(), ring)?;
+        let inner = KvStoreInner::open(root_dir, bg_cond.clone(), ring.clone())?;
         let inner = Arc::new(inner);
 
-        let compactor = Arc::new(Compactor::new(inner.clone(), bg_cond.clone()));
+        let compactor = Arc::new(Compactor::new(inner.clone(), bg_cond, ring));
         let compactor2 = compactor.clone();
         let compactor3 = compactor.clone();
+        let suicide = Arc::new(CompactorSuicide{compactor: compactor.clone()});
 
         std::thread::spawn(move || compactor2.monitor_loop());
         std::thread::spawn(move || compactor3.flush_compaction_loop());
-        Ok( KvStore { inner, _compactor: compactor } )
+        Ok( KvStore { inner, _compactor: compactor, _suicide: suicide } )
     }
 
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self> {
         let bg_cond = Arc::new(Condvar::new());
         let ring = Arc::new(create_buf_ring());
-        let inner = KvStoreInner::new(root_dir, bg_cond.clone(), ring)?;
+        let inner = KvStoreInner::new(root_dir, bg_cond.clone(), ring.clone())?;
         let inner = Arc::new(inner);
 
-        let compactor = Arc::new(Compactor::new(inner.clone(), bg_cond.clone()));
+        let compactor = Arc::new(Compactor::new(inner.clone(), bg_cond, ring));
         let compactor2 = compactor.clone();
         let compactor3 = compactor.clone();
+        let suicide = Arc::new(CompactorSuicide{compactor: compactor.clone()});
 
         std::thread::spawn(move || compactor2.monitor_loop());
         std::thread::spawn(move || compactor3.flush_compaction_loop());
-        Ok( Self { inner, _compactor: compactor })
+        Ok( Self { inner, _compactor: compactor, _suicide: suicide })
     }
 }
 
@@ -58,11 +61,16 @@ impl KvsEngine for KvStore {
     }
 }
 
-/// The drop of KvStore will force memtable flush, it is triggered by
-/// the drop of Compactor.
-impl Drop for KvStore {
-    fn drop(&mut self) { }
+struct CompactorSuicide {
+    compactor: Arc<Compactor>
 }
+
+impl Drop for CompactorSuicide {
+    fn drop(&mut self) {
+        self.compactor.suicide();
+    }
+}
+
 
 #[cfg(test)]
 mod kvstore_unit_test {
@@ -88,13 +96,14 @@ mod kvstore_unit_test {
         // concurrent set
         let mut write_threads = Vec::new();
         for i in 0..num_set_threads {
-            let kvs_handle = kvs.clone();
+            let kvs2 = kvs.clone();
             let thread_handle = std::thread::spawn(move || {
                 for j in 0..num_records_per_thread {
                     let key = format!("key-{}-{}", i, j);
                     let value = format!("value-{}-{}", i, j);
-                    kvs_handle.set(key, value).unwrap();
+                    kvs2.set(key, value).unwrap();
                 }
+                println!("thread {} exit", i);
             });
             write_threads.push(thread_handle);
         }

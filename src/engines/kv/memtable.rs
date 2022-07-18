@@ -118,7 +118,7 @@ impl Memtable {
                 let is_remove = value.is_none();
                 let value_before
                     = self.index.insert(key.to_owned(), MemtableValue::Value((vid, value)));
-                let exist = value_before.is_some();
+                let value_exist = value_before.is_some();
                 // the previous value's length
                 let value_len_before = match value_before {
                     Some(key_value) => match key_value.val() {
@@ -130,9 +130,21 @@ impl Memtable {
                     },
                     None => 0,
                 };
-
+                // track uncompacted keys
+                let uncompacted = unsafe {
+                    self.uncompacted_keys_ptr.load(Relaxed)
+                    .as_ref().unwrap()
+                    .as_inner()
+                };
+                let _ = uncompacted.insert(key.to_owned());
                 // for esstimating the size after compaction
-                let delta: isize = value_len as isize - value_len_before as isize;
+                let delta: isize = {
+                    let mut len = value_len as isize - value_len_before as isize;
+                    if !value_exist {
+                        len += key_len as isize;
+                    }
+                    len
+                };
                 if delta >= 0 {
                     self.estimate_total_compaction.fetch_add(delta as usize, SeqCst);
                 } else {
@@ -144,9 +156,9 @@ impl Memtable {
                 // wake up background thread if size exceed flush threshold
                 if unflushed_size > self.flush_limit {
                     self.wake_up_flush_or_compaction();
+                    std::thread::sleep(std::time::Duration::from_micros(1));
                 }
-
-                if is_remove && !exist {
+                if is_remove && !value_exist {
                     return MemtableAccessState::ErrRemoveNonExist
                 } else {
                     return MemtableAccessState::Ok
@@ -186,7 +198,7 @@ impl Memtable {
         }
         let estimate = self.estimate_total.load(Relaxed);
         let estimate_after_compaction = self.estimate_total.load(Relaxed);
-        if estimate > Compactor::INIT_COMPACT_LIMIT && estimate * 4 / 3 > estimate_after_compaction {
+        if estimate > Compactor::INIT_COMPACT_LIMIT && estimate * 3 / 4 > estimate_after_compaction {
             return ShouldFlushOrCompact::Compact
         } else {
             return ShouldFlushOrCompact::Flush
@@ -211,12 +223,12 @@ impl Memtable {
     }
 
     pub fn pause_for_swap_buf(&self) -> MemtablePause {
-        self.state.compare_exchange(
+        while let Err(_) = self.state.compare_exchange(
             Self::_MEMTABLE_OK,
             Self::_MEMTABLE_RETRY,
             Acquire,
             Relaxed)
-        .unwrap();
+        { }
 
         let ctrl_guard = self.ctrl.pause_write();
         MemtablePause {
@@ -241,7 +253,12 @@ impl Memtable {
     /// The CtrlGuard returned from this function should be consumed when flush task is finish, just call `Memtable::finish_flush`
     /// and pass it as argument.
     pub fn pause_for_reset_flush_rids(&self) -> MemtablePause {
-        self.state.compare_exchange(Self::_MEMTABLE_OK, Self::_MEMTABLE_FLUSHING, Acquire, Relaxed).unwrap();
+        while let Err(_) = self.state.compare_exchange(
+            Self::_MEMTABLE_OK,
+            Self::_MEMTABLE_FLUSHING,
+            Acquire,
+            Relaxed) { }
+
         let ctrl_guard = self.ctrl.pause_write();
         MemtablePause {
             _safe_drop: false,
@@ -255,7 +272,12 @@ impl Memtable {
     /// Reset rids for all compacted keys. This function is just as same as `prepare_flush` expect all cached uncompacted_keys
     /// will be removed because compaction task doesn't care of it, and self.state will change to _MEMTABLE_COMPACTION. 
     pub fn pause_for_reset_compaction_rids(&self) -> MemtablePause {
-        self.state.compare_exchange(Self::_MEMTABLE_OK, Self::_MEMTABLE_COMPACTION, Acquire, Relaxed).unwrap();
+        while let Err(_) = self.state.compare_exchange(
+            Self::_MEMTABLE_OK,
+            Self::_MEMTABLE_COMPACTION,
+            Acquire,
+            Relaxed) { }
+
         let ctrl_guard = self.ctrl.pause_write();
         let pause = MemtablePause {
             _safe_drop: false,
@@ -281,6 +303,10 @@ impl Memtable {
             self.state.load(Relaxed) == Self::_MEMTABLE_OK &&
             self.ctrl.check_no_pending_requests()
         );
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
+        self.index.iter()
     }
 
     pub fn advance_version(&self) -> Vid {
@@ -314,10 +340,6 @@ impl Memtable {
     /// wake up background thread to perform flush/compaction
     fn wake_up_flush_or_compaction(&self) {
         self.bg_cond.notify_all();
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = ReadGuard<String, MemtableValue>> {
-        self.index.iter()
     }
 }
 
@@ -428,11 +450,11 @@ mod memtable_unit_test {
         }
 
         println!("
-            thread {} set {} records,\n
-            total retry: {}\n,
-            again_retry: {}\n,
-            flush_retry: {}\n,
-            compaction_retry: {}\n", 
+            thread {} set {} records,
+            total retry: {},
+            again_retry: {},
+            flush_retry: {},
+            compaction_retry: {}", 
             tid, num_records,
             stat.swap_reject + stat.flush_reject + stat.compact_reject,
             stat.swap_reject,
@@ -609,6 +631,8 @@ mod memtable_unit_test {
             handle.join().unwrap();
         }
 
+        let last = memtable.swap_buf(BufNodePtr::from(std::ptr::null_mut()), false);
+        ring.lock().unwrap().release_buf(last);
         Ok(())
     }
 
@@ -617,22 +641,29 @@ mod memtable_unit_test {
         use super::ShouldFlushOrCompact;
 
         let ring = Arc::new(create_buf_ring());
-        let bg_cond = Arc::new(Condvar::new()); 
+        let cond = Arc::new(Condvar::new()); 
         let memtable = Arc::new(Memtable::new(
-            1<<14,
-            bg_cond.clone(),
+            1<<16,
+            cond.clone(),
             ring.lock().unwrap().alloc_buf().unwrap()
         ));
-        
-        let cleaner_cond = Arc::new(Condvar::new());
-        let monitor_cleaner_cond = cleaner_cond.clone();
+        let running = Arc::new(Mutex::new(true));
+
         let monitor_ring = ring.clone();
-        let monitor_cond = bg_cond.clone();
+        let monitor_cond = cond.clone();
         let monitor_memtable = memtable.clone();
+        let running2 = running.clone();
 
         let (sender, receiver) = channel();
-        let monitor = move |tx: std::sync::mpsc::Sender<BufNodePtr>| {
+        let monitor = move || {
+            let mut cnt = 0;
             loop {
+                let guard = running2.lock().unwrap();
+                if *guard == false {
+                    break;
+                }
+                let _ = monitor_cond.wait(guard);
+
                 match monitor_memtable.should_flush_or_compact() {
                     ShouldFlushOrCompact::No => {
                         continue;
@@ -653,22 +684,27 @@ mod memtable_unit_test {
                         let pause = monitor_memtable.pause_for_swap_buf();
                         let old = monitor_memtable.swap_buf(bufptr, false);
                         monitor_memtable.finish(pause);
-                        tx.send(old).unwrap();
+                        println!("bufswap!");
+                        sender.send(old).unwrap();
+                        cnt += 1;
                     }
                }
             }
+
+            println!("total buf swap: {}", cnt)
         };
         
         let cleaner_ring = ring.clone();
-        let cleaner_me_cond = cleaner_cond.clone();
-        let cleaner = move |rx: std::sync::mpsc::Receiver<BufNodePtr>| {
+        let cleaner = move || {
             loop {
-                match rx.recv() {
-                    Err(_) => {
+                match receiver.recv() {
+                    Err(err) => {
+                        println!("{}", err);
                         break;
                     }
 
                     Ok(bufptr) => {
+                        println!("do flush/compaction task");
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         cleaner_ring.lock().unwrap().release_buf(bufptr);
                     }
@@ -676,8 +712,8 @@ mod memtable_unit_test {
             }
         };
 
-        let monitor_handle = std::thread::spawn(move || monitor(sender));
-        let cleaner_handle = std::thread::spawn(move || cleaner(receiver));
+        let monitor_handle = std::thread::spawn(move || monitor());
+        let cleaner_handle = std::thread::spawn(move || cleaner());
         
         let num_threads = 100;
         let num_records_per_thread = 2000;
@@ -698,217 +734,14 @@ mod memtable_unit_test {
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
+        *running.lock().unwrap() = false;
+        cond.notify_all();
+        monitor_handle.join().unwrap();
+        cleaner_handle.join().unwrap();
+
+        let last = memtable.swap_buf(BufNodePtr::from(std::ptr::null_mut()), false);
+        ring.lock().unwrap().release_buf(last);
         Ok(())
     }
-
-    // #[test]
-    // fn multi_thread_test() -> Result<()> {
-    //     let nthreads = 100;
-    //     let record_per_thread = 2000;
-
-    //     let ring = Arc::new(create_buf_ring());
-    //     let cond = Arc::new(Condvar::new());
-    //     let running = Arc::new(Mutex::new(true));
-    //     let memtable = Arc::new(
-    //         Memtable::new(
-    //             1<<14,
-    //             cond.clone(),
-    //             ring.lock().unwrap().alloc_buf().unwrap())
-    //         );
-
-    //     let bg_ring = ring.clone();
-    //     let bg_cond = cond.clone();
-    //     let bg_running = running.clone();
-    //     let bg_memtable = memtable.clone();
-    //     let bg_flush_compaction_handle = std::thread::spawn(move || {
-    //         loop {
-    //             let running_guard = bg_running.lock().unwrap();
-    //             if !*running_guard {
-    //                 break;
-    //             }
-    //             _ = bg_cond.wait(running_guard);
-            
-                
-    //             if !bg_memtable.should_flush() {
-    //                 continue;
-    //             }
-    //             // mock flush or compaction
-    //             let x: u8 = rand::random();
-    //             let _guard;
-
-    //             let ptr = loop {
-    //                 match bg_ring.lock().unwrap().alloc_buf() {
-    //                     Some(new_buf_ptr) => {
-    //                         println!("alloc buf");
-    //                         break new_buf_ptr
-    //                     },
-    //                     None => {
-    //                         std::thread::sleep(std::time::Duration::from_millis(10));
-    //                         continue;
-    //                     },
-    //                 }
-    //             };
-
-    //             if 0 == (x & 1) {
-    //                 // let node = bg_ring.lock().unwrap().alloc_buf();
-    //                 // _guard = bg_memtable.prepare_reset_compaction_rids();
-    //                 // std::thread::sleep(std::time::Duration::from_millis(50));
-    //             } else {
-    //                 // _guard = bg_memtable.prepare_reset_flushed_rids();
-    //                 std::thread::sleep(std::time::Duration::from_millis(10));
-    //             }
-    //             // pretend that we have take all uncompacted keys...
-    //             bg_memtable.estimitate.store(0, SeqCst);
-    //             // bg_memtable.finish_flush(_guard);
-    //         }
-    //     });
-
-    //     let mut handles = Vec::new();
-    //     for i in 0..nthreads {
-    //         let memtable2 = memtable.clone();
-    //         let h = std::thread::spawn(move || {
-    //             for j in 0..record_per_thread {
-    //                 let key = format!("key-{}-{}", i, j);
-    //                 let value = format!("value-{}-{}", i, j);
-
-    //                 loop {
-    //                     match memtable2.try_set(&key, (&value).to_owned()) {
-    //                         super::MemtableAccessState::Ok => {
-    //                             break;
-    //                         },
-
-    //                         super::MemtableAccessState::Retry => {
-    //                             continue;
-    //                         },
-
-    //                         super::MemtableAccessState::FlushReject => {
-    //                             println!("flush reject");
-    //                             std::thread::sleep(std::time::Duration::from_millis(10));
-    //                         },
-
-    //                         super::MemtableAccessState::CompactionReject => {
-    //                             println!("compaction reject");
-    //                             std::thread::sleep(std::time::Duration::from_millis(50));
-    //                         },
-
-    //                         _ => {
-    //                             unreachable!("");
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //             println!("thread {} exit", i);
-    //         });
-    //         handles.push(h);
-    //     }
-
-    //     for h in handles {
-    //         h.join().unwrap();
-    //     }
-
-    //     *running.lock().unwrap() = false;
-    //     cond.notify_all();
-    //     bg_flush_compaction_handle.join().unwrap();
-
-    //     for i in 0..nthreads {
-    //         for j in 0..record_per_thread {
-    //             let key = format!("key-{}-{}", i, j);
-    //             let value = format!("value-{}-{}", i, j);
-
-    //             loop {
-    //                 match memtable.try_get(&key) {
-    //                     (super::MemtableAccessState::Ok, res) => {
-    //                         if let Some(MemtableValue::Value(valstr)) = res {
-    //                             assert_eq!(valstr.1.unwrap(), value);
-    //                         } else {
-    //                             panic!("get failed");
-    //                         }
-    //                         break;
-    //                     },
-
-    //                     (super::MemtableAccessState::Retry, _) => {
-    //                         continue;
-    //                     },
-
-    //                     _ => {
-    //                         unreachable!("");
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     let mut handles = Vec::new();
-    //     for i in 0..nthreads {
-    //         let memtable2 = memtable.clone();
-    //         let handle = std::thread::spawn(move || {
-    //             for j in 0..record_per_thread/2 {
-    //                 let key = format!("key-{}-{}", i, j);
-
-    //                 loop {
-    //                     match memtable2.try_remove(&key) {
-    //                         super::MemtableAccessState::Ok => {
-    //                             break;
-    //                         }
-    //                         super::MemtableAccessState::Retry => {
-    //                             continue;
-    //                         }
-    //                         super::MemtableAccessState::FlushReject => {
-    //                             std::thread::sleep(std::time::Duration::from_millis(10));
-    //                             continue;
-    //                         }
-    //                         super::MemtableAccessState::CompactionReject => {
-    //                             std::thread::sleep(std::time::Duration::from_millis(50));
-    //                             continue;
-    //                         }
-    //                         _ => {
-    //                             unreachable!("");
-    //                         }
-    //                     }
-    //                 }
-    //             }
-
-    //             for j in 0..record_per_thread {
-    //                 let key = format!("key-{}-{}", i, j);
-    //                 let value = format!("value-{}-{}", i, j);
-    //                 loop {
-    //                     match memtable2.try_get(&key) {
-    //                         (super::MemtableAccessState::Ok, res) => {
-    //                             if j < record_per_thread/2 {
-    //                                 // values should be removed.
-    //                                 if let Some(MemtableValue::Value((_, None))) = res {
-    //                                     // success
-    //                                 } else {
-    //                                     panic!("remove failed");
-    //                                 }
-    //                             } else {
-    //                                 // values should be keeped.
-    //                                 if let Some(MemtableValue::Value(valstr)) = res {
-    //                                     assert_eq!(valstr.1.unwrap(), value);
-    //                                 } else {
-    //                                     panic!("get failed");
-    //                                 }
-    //                             }
-    //                             break;
-    //                         },
-
-    //                         (super::MemtableAccessState::Retry, _) => {
-    //                             continue;
-    //                         },
-
-    //                         _ => {
-    //                             unreachable!("");
-    //                         }
-    //                     }
-    //                 }
-    //             }
-
-    //             println!("thread {} exit", i);
-    //         });
-    //         handles.push(handle);
-    //     }
-
-    //     Ok(())
-    // }
 }
