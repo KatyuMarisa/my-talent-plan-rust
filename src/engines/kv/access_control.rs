@@ -11,7 +11,7 @@ use std::sync::{
 /// |    UNUSED    |_BIT_PAUSE_ALL|_BIT_PAUSE_WRITE| Write Pincount | Read Pincount |
 /// | 63........22 |      21      |       20       | 19..........10 | 9...........0 |
 /// +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-/// +                           A t o m i c U s i z e                               *
+/// +                           A t o m i c U s i z e                               +
 /// +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 /// 
 pub struct AccessController {
@@ -37,32 +37,58 @@ impl AccessController {
     /// During the lifetime of `CtrlGuard` returned from this function, all Outer's read operation is valid. Outer's
     /// read operation without holding `CtrlGuard` returned from this function is undefined behaviour.
     pub fn guard_read(&self) -> Option<CtrlGuard> {
-        let pin = self._pin_count.load(Relaxed);
-        if Self::_read_allow(pin) &&
-            self._pin_count.compare_exchange(pin, pin + 1, Acquire, Relaxed).is_ok() {
-            let destructor = Box::new(|ct: &AccessController| {
-                ct._pin_count.fetch_sub(1, SeqCst);
-            });
-            
-            return Some(CtrlGuard { ctrl: self, destructor })
+        let mut pin = self._pin_count.load(Relaxed);
+        loop {
+            if !Self::_read_allow(pin) {
+                return None
+            }
+
+            match self._pin_count.compare_exchange(
+                pin, 
+                pin + 1,
+                Acquire,
+                Relaxed) {
+                Ok(_) => {
+                    let destructor = Box::new(|ct: &AccessController| {
+                        ct._pin_count.fetch_sub(1, SeqCst);
+                    });                        
+
+                    return Some(CtrlGuard{ctrl: self, destructor})
+                },
+                Err(new_pin) => {
+                    pin = new_pin;
+                },
+            }
         }
-        None
     }
 
     /// Outer requests for a write operation.
     /// During the lifetime of `CtrlGuard` returned from this function, all Outer's read requests is valid. Outer's
     /// write operation without holding `CtrlGuard` returned from this function is undefined behaviour.
     pub fn guard_write(&self) -> Option<CtrlGuard> {
-        let pin = self._pin_count.load(Relaxed);
-        if Self::_write_allow(pin) &&
-            self._pin_count.compare_exchange(pin, pin + (1<<10), Acquire, Relaxed).is_ok() {
-            let destructor = Box::new(|ct: &AccessController| {
-                ct._pin_count.fetch_sub(1<<10, Acquire);
-            });
+        let mut pin = self._pin_count.load(Relaxed);
+        loop {
+            if !Self::_write_allow(pin) {
+                return None;
+            }
 
-            return Some(CtrlGuard { ctrl: self, destructor })
+            match self._pin_count.compare_exchange(
+                pin, 
+                pin + (1 << 10),
+                Acquire,
+                Relaxed) {
+                Ok(_) => {
+                    let destructor = Box::new(|ct: &AccessController| {
+                        ct._pin_count.fetch_sub(1<<10, Acquire);
+                    });
+                    return Some(CtrlGuard { ctrl: self, destructor })
+                },
+
+                Err(new_pin) => {
+                    pin = new_pin;
+                },
+            }
         }
-        None
     }
 
     /// Pause all outer's write requests.
@@ -70,10 +96,15 @@ impl AccessController {
     /// is guaranteed to return None, and all remaining write requests is drained. A write operation
     pub fn pause_write(&self) -> CtrlGuard {
         // reject all incoming write requests
+        let mut pin = self._pin_count.load(Relaxed);
         loop {
-            let pin = self._pin_count.load(Relaxed);
-            if self._pin_count.compare_exchange(pin, pin | Self::_BIT_PAUSE_WRITE, Acquire, Relaxed).is_ok() {
-                break;
+            match self._pin_count.compare_exchange(
+                pin,
+                pin | Self::_BIT_PAUSE_WRITE,
+                Acquire,
+                Relaxed) {
+                Ok(_) => break,
+                Err(new_pin) => pin = new_pin,
             }
         }
         // all incoming write requests is rejected, busy wait for all remaining write requests finish...
@@ -97,10 +128,15 @@ impl AccessController {
     /// requests is drained.
     #[allow(dead_code)]
     pub fn pause_all(&self) -> CtrlGuard {
+        let mut pin = self._pin_count.load(Relaxed);
         loop {
-            let pin = self._pin_count.load(Relaxed);
-            if self._pin_count.compare_exchange(pin, pin | Self::_BIT_PAUSE_ALL, Acquire, Relaxed).is_ok() {
-                break;
+            match self._pin_count.compare_exchange(
+                pin,
+                pin | Self::_BIT_PAUSE_ALL,
+                Acquire,
+                Relaxed) {
+                Ok(_) => break,
+                Err(new_pin) => pin = new_pin,
             }
         }
 
@@ -129,6 +165,7 @@ impl AccessController {
         Self::_all_requests_drained(pin)
     }
 
+    #[allow(dead_code)]
     pub fn check_no_pending_requests(&self) -> bool {
         let pin = self._pin_count.load(Relaxed);
         pin == 0 || pin == Self::_BIT_PAUSE_ALL
@@ -136,12 +173,12 @@ impl AccessController {
 
     #[inline(always)]
     fn _read_allow(pin: usize) -> bool {
-        (Self::_BIT_PAUSE_ALL..).contains(&pin)
+        !(Self::_BIT_PAUSE_ALL..).contains(&pin)
     }
 
     #[inline(always)]
     fn _write_allow(pin: usize) -> bool {
-        (Self::_BIT_PAUSE_WRITE..).contains(&pin)
+        !(Self::_BIT_PAUSE_WRITE..).contains(&pin)
     }
 
     #[inline(always)]
@@ -163,7 +200,6 @@ impl AccessController {
 pub struct CtrlGuard<'a>
 {
     ctrl: &'a AccessController,
-    // TODO: Use FnOnce instead of Fn
     destructor: Box<dyn Fn(&AccessController)>,
 }
 

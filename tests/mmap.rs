@@ -86,7 +86,7 @@ mod mmap_learn_tests {
 
         let map = LockFreeMap::<KeyGuard, String>::new();
         map.insert( KeyGuard { ver: 1, key: "1".to_owned()}, "1".to_owned());
-        map.insert_with( KeyGuard {ver: 2, key: "1".to_owned()},  |k, ov, okv|{
+        map.insert_with( KeyGuard {ver: 2, key: "1".to_owned()},  |k, _, okv|{
             if let Some((kk, _)) = okv {
                 match kk.ver.cmp(&k.ver) {
                     std::cmp::Ordering::Less => {

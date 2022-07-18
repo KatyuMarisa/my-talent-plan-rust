@@ -88,7 +88,7 @@ Arc<T>实现了Send，则 & immut Arc<T>实现了Sync，使得我们不需要关
 
     thread_read_write() {
         atomic {
-            if IsCompacting == CheckState() {               // 也许可以用CAS完成，设定符号位为is_compacting就行了
+            if COMPACTING == CheckState() {               // 也许可以用CAS完成，设定符号位为is_compacting就行了
                 return ErrAgain
             } else {
                 pin_count+= 1;
@@ -98,9 +98,9 @@ Arc<T>实现了Send，则 & immut Arc<T>实现了Sync，使得我们不需要关
         do something;
 
         atomic {
-            size += len;
-            if size > compact_limit {
-                SetState(SHOULD_COMPACT);
+            self.size += len;
+            if self.size > compact_limit {
+                self.SetState(SHOULD_COMPACT);
             }
             pin_count -= 1;
         }
@@ -735,3 +735,44 @@ flush和compaction会阻塞所有读/写请求。（1）flush/compaction与读/�
             remove file is guaranteed to be safe.
         }
     }
+
+TODO: 避免空间浪费，将length字段添加到SSTable里面吧
+
+Background的设计，到底是poll还是notify？之前是notify，因为必须提供一个force flush接口
+
+AtomicPtr + Unsafe 可以解决我的问题，但又有了一个新的问题：指针含有其指向对象的所有权，因此必须额外保证不能有dangling pointer。个人的思路是直接从BufRing里面拿，用容器盛放，使用take + drop清空，用两个lockfree链表（待处理的Buffer和空闲的Buffer）管理缓冲区；
+
+有锁也无所谓了，反正锁是在compact的时候拿的，只是为了避免
+
+
+
+    pub unsafe fn alloc_buf(&mut self) -> Option<BufPtr> {
+        if self.free.is_empty() {
+            return None
+        }
+
+        let set = self.free.pop_front().unwrap();
+        self.using.push_back(set);
+
+        let buf_ref = self.using.back_mut().unwrap();
+
+        let raw_ptr = &mut self.using.back_mut().unwrap().val
+            as *mut LockFreeSet<String>;
+
+        Some(BufPtr::new(raw_ptr))
+    }
+
+这个设计看起来很不安全，因为我们不清楚drop的次序，如果`BufRing`的drop先于`Memtable`，那么`Memtable`可能会load到悬空指针，造成未定义行为。因此我不想将缓冲内存放在`BufRing`的成员中。
+一个方案是定义一块static的内存，另一个办法是创建一块自己的内存
+    Rust aliasing rules in precise: 
+    * If you create a safe reference with lifetime 'a (either a &T or &mut T reference) that is accessible by safe code (for example, because you returned it), then you must not access the data in any way that contradicts that reference for the remainder of 'a. For example, this means that if you take the *mut T from an UnsafeCell<T> and cast it to an &T, then the data in T must remain immutable (modulo any UnsafeCell data found within T, of course) until that reference’s lifetime expires. Similarly, if you create a &mut T reference that is released to safe code, then you must not access the data within the UnsafeCell until that reference expires.
+
+    * At all times, you must avoid data races. If multiple threads have access to the same UnsafeCell, then any writes must have a proper happens-before relation to all other accesses (or use atomics).
+
+今晚上懂的东西挺重要的：
+    第一，borrow check是编译时行为，没有运行时开销。`RefCell`给了人一种borrow check可以运行期间进行的错觉，这是错的，它的实现比较特殊而已。
+    第二，rust alising rule很精彩。borrow checker的规则阻止了你做很多事情，你很头痛，于是转向unsafe rust。通过unsafe rust，你能变更引用的可变性，能直接操纵内存，能把指针甩的满天飞，但你仍不自由，你只是把borrow checker强迫你做的事情揽到了你的身上而已：同一时刻，要么有多个不限量的不可变引用，要么至多只有一个可变借用。否则，你必定承受UB的代价。另外，data race是被钉死在耻辱柱上的UB，一般需要用原子操作解决UB问题。
+    第三，const *T可以转型为mut *T，Cell就是这样做的
+
+
+RAII Lock很不灵活，一旦忘记drop的临界条件，太容易死锁了。。

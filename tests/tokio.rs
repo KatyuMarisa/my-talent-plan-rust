@@ -25,4 +25,9 @@ mod tokio_learn_test {
         std::thread::sleep(std::time::Duration::from_secs(6));
         println!("end!");        
     }
+
+    fn atomic_test() {
+
+        // std::sync::atomic::AtomicPtr::new();
+    }
 }

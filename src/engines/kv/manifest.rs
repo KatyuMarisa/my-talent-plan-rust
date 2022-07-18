@@ -138,6 +138,7 @@ impl Manifest {
         return self.files.iter().copied().collect();
     }
 
+    #[allow(dead_code)]
     pub fn disk_usage(&self) -> usize {
         self.files.len() * FILE_SIZE_LIMIT
     }

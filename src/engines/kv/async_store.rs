@@ -1,50 +1,49 @@
 use crate::Result;
 use crate::engines::AsyncKvsEngine;
 use crate::thread_pool::ThreadPool;
-use super::drop_guard::DropGuard;
-use super::inner::{KvStoreInner, State};
+use super::bufring::create_buf_ring;
+use super::inner::KvStoreInner;
 
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Condvar};
 
 #[derive(Clone)]
 pub struct AsyncKvStore<P: ThreadPool> {
     pool: P,
     inner: Arc<KvStoreInner>,
-    #[allow(dead_code)]
-    drop_guard: Arc<DropGuard>,
 }
 
 impl<P: ThreadPool> AsyncKvStore<P> {
     pub fn open(root_dir: impl Into<PathBuf>, nthread: u32) -> Result<Self> {
         let pool = P::new(nthread)?;
-        let state = Arc::new(Mutex::new(State::Running));
+        let ring = Arc::new(create_buf_ring());
         let bg_cond = Arc::new(Condvar::new());
-        let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), state.clone())?);
-        let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
+        let inner = Arc::new(KvStoreInner::open(root_dir, bg_cond.clone(), ring)?);
+        // let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
 
         let inner2 = inner.clone();
-        std::thread::spawn(move || {
-            inner2.bg_flush_compaction_loop();
-        });
-        Ok( Self{ pool, inner, drop_guard } )
+        // std::thread::spawn(move || {
+        //     inner2.bg_flush_compaction_loop();
+        // });
+        // Ok( Self{ pool, inner } )
+        todo!();
     }
 
     pub fn new(root_dir: impl Into<PathBuf>, nthread: u32) -> Result<Self> {
         let pool = P::new(nthread)?;
-        let state = Arc::new(Mutex::new(State::Running));
+        let ring = Arc::new(create_buf_ring());
         let bg_cond = Arc::new(Condvar::new());
-        let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), state.clone())?);
-        let drop_guard = Arc::new(DropGuard::new(state, bg_cond));
+        let inner = Arc::new(KvStoreInner::new(root_dir, bg_cond.clone(), ring)?);
         let inner2 = inner.clone();
-        std::thread::spawn(move || {
-            inner2.bg_flush_compaction_loop();
-        });
+        // std::thread::spawn(move || {
+        //     inner2.bg_flush_compaction_loop();
+        // });
   
-        Ok(Self{ pool, inner, drop_guard })
+        // Ok(Self{ pool, inner })
+        todo!();
     }
 
     async fn schedule<F, R>(&self, func: F) -> R
